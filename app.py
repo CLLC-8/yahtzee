@@ -207,6 +207,7 @@ def on_join(data):
 def on_set_score(data):
     g, ok = auth(data)
     if not ok:
+        emit("denied")
         return
     i = data.get("player")
     cat = data.get("category")
@@ -496,6 +497,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     background:var(--panel-2);border:1px solid var(--line);color:var(--muted);font-size:20px;line-height:1;
     display:flex;align-items:center;justify-content:center}
 
+  .offlinebar{position:fixed;top:0;left:0;right:0;background:#3a2a12;color:var(--gold);text-align:center;
+    font-size:12px;padding:6px;z-index:70;transform:translateY(-100%);transition:transform .2s}
+  .offlinebar.show{transform:translateY(0)}
+
   .toast{position:fixed;left:50%;bottom:calc(20px + var(--safe-b));transform:translateX(-50%) translateY(20px);
     background:#222;color:#fff;padding:11px 18px;border-radius:11px;font-size:14px;opacity:0;transition:.2s;pointer-events:none;z-index:60;border:1px solid #3a3a3a}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
@@ -595,7 +600,8 @@ const LS="yahtzee_table_game";
 const $=id=>document.getElementById(id);
 function show(sec){["setup","board"].forEach(s=>$(s).classList.toggle("hidden",s!==sec));$("loading").classList.add("hidden");}
 function toast(m){const t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),1700);}
-function save(){if(editor&&gid&&token&&S){localStorage.setItem(LS,JSON.stringify({id:gid,token,snapshot:{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,current:S.current}}));}}
+function readStored(){try{return JSON.parse(localStorage.getItem(LS)||"null");}catch(e){return null;}}
+function save(){if(token&&gid){localStorage.setItem(LS,JSON.stringify({id:gid,token,snapshot:S?{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,current:S.current}:null}));}}
 
 function scoreFor(cat,dice){
   const c={};dice.forEach(d=>c[d]=(c[d]||0)+1);
@@ -611,24 +617,40 @@ function scoreFor(cat,dice){
   return 0;
 }
 
-/* ---------- connexion / rôle ---------- */
-socket.on("connect",()=>{
-  const params=new URLSearchParams(location.search);
-  const g=params.get("game");
-  const stored=JSON.parse(localStorage.getItem(LS)||"null");
+/* ---------- identité / connexion ----------
+   Être éditeur = posséder le jeton secret de la partie (stocké sur l'appareil).
+   On le ré-affirme à chaque (re)connexion et au retour de page (précédent/
+   suivant), pour ne jamais retomber en lecture seule par accident. */
+function identify(){
+  const g=new URLSearchParams(location.search).get("game");
+  const stored=readStored();
   if(g){
     if(stored&&stored.id===g){gid=g;token=stored.token;socket.emit("resume",stored);}
-    else{gid=g;socket.emit("join_game",{id:g});}
+    else{gid=g;token=null;socket.emit("join_game",{id:g});}
   }else if(stored){
     gid=stored.id;token=stored.token;socket.emit("resume",stored);
   }else{
     openSetup();
   }
-});
+  editor=!!token;
+}
+function setOnline(on){
+  let el=$("offlinebar");
+  if(!el){el=document.createElement("div");el.id="offlinebar";el.className="offlinebar";el.textContent="Reconnexion…";document.body.appendChild(el);}
+  el.classList.toggle("show",!on);
+}
+
+socket.on("connect",()=>{setOnline(true);identify();});
+socket.on("disconnect",()=>setOnline(false));
 socket.on("created",d=>{gid=d.id;token=d.token;editor=true;history.replaceState(null,"","?game="+gid);save();});
-socket.on("role",d=>{editor=!!d.editor;});
-socket.on("no_game",()=>{toast("Partie introuvable");localStorage.removeItem(LS);history.replaceState(null,"",location.pathname);openSetup();});
-socket.on("state",s=>{S=s;if(!gid)gid=s.id;save();render();});
+socket.on("role",d=>{editor=!!token||!!d.editor;if(S)render();});
+socket.on("denied",()=>{const stored=readStored();if(stored&&stored.id===gid)socket.emit("resume",stored);});
+socket.on("no_game",()=>{toast("Partie introuvable");localStorage.removeItem(LS);history.replaceState(null,"",location.pathname);editor=false;token=null;openSetup();});
+socket.on("state",s=>{S=s;if(!gid)gid=s.id;editor=!!token;save();render();});
+
+/* retour précédent/suivant (page restaurée depuis le cache) */
+window.addEventListener("pageshow",e=>{if(e.persisted){if(socket.connected)identify();else socket.connect();}});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&!socket.connected)socket.connect();});
 
 /* ---------- SETUP ---------- */
 let nPlayers=4, diceOn=false;
