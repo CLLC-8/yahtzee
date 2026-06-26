@@ -98,6 +98,7 @@ def make_game(gid, token, names, dice_enabled):
         "dice_enabled": bool(dice_enabled),
         "dice": [1, 1, 1, 1, 1], "held": [False] * 5,
         "rolls_left": 3, "turn_rolled": False,
+        "current": 0,
     }
 
 
@@ -117,7 +118,7 @@ def serialize(g):
         "dice_enabled": g["dice_enabled"],
         "dice": g["dice"], "held": g["held"],
         "rolls_left": g["rolls_left"], "turn_rolled": g["turn_rolled"],
-        "complete": complete, "leader": leader,
+        "complete": complete, "leader": leader, "current": g["current"],
     }
 
 
@@ -178,6 +179,8 @@ def on_resume(data):
             for c in CATEGORIES:
                 v = sc.get(c)
                 g["players"][i]["scores"][c] = v if isinstance(v, int) else None
+        cu = snap.get("current", 0)
+        g["current"] = cu if isinstance(cu, int) and 0 <= cu < len(g["players"]) else 0
         games[gid] = g
         join_room(gid)
         emit("role", {"editor": True})
@@ -213,7 +216,11 @@ def on_set_score(data):
     if val is None:
         g["players"][i]["scores"][cat] = None
     elif isinstance(val, (int, float)):
+        was = g["players"][i]["scores"][cat]
         g["players"][i]["scores"][cat] = max(0, min(999, int(val)))
+        # quand le joueur en cours remplit une case vide -> au suivant
+        if was is None and i == g["current"]:
+            g["current"] = (g["current"] + 1) % len(g["players"])
     broadcast(g["id"])
 
 
@@ -226,6 +233,17 @@ def on_set_name(data):
     name = (data.get("name") or "").strip()[:18]
     if isinstance(i, int) and 0 <= i < len(g["players"]) and name:
         g["players"][i]["name"] = name
+        broadcast(g["id"])
+
+
+@socketio.on("set_current")
+def on_set_current(data):
+    g, ok = auth(data)
+    if not ok:
+        return
+    i = data.get("player")
+    if isinstance(i, int) and 0 <= i < len(g["players"]):
+        g["current"] = i
         broadcast(g["id"])
 
 
@@ -246,6 +264,10 @@ def on_remove_player(data):
     i = data.get("player")
     if isinstance(i, int) and 0 <= i < len(g["players"]) and len(g["players"]) > 1:
         g["players"].pop(i)
+        if i < g["current"]:
+            g["current"] -= 1
+        if g["current"] >= len(g["players"]):
+            g["current"] = 0
         broadcast(g["id"])
 
 
@@ -454,6 +476,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border-radius:11px;padding:13px 14px;font-size:17px;font-family:inherit;outline:none;text-align:center;margin-bottom:6px}
   .modal input.name:focus{border-color:var(--gold)}
 
+  .turntag{display:block;height:14px;line-height:14px;font-size:10px;color:var(--gold);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+  .phead.cur{background:rgba(240,181,61,.12)}
+  .phead.cur .nm{color:var(--gold)}
+  .cell.cur{background:rgba(240,181,61,.06)}
+  .cell.cur.editable:active{background:rgba(240,181,61,.18)}
+
+  .multi{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:4px}
+  .mbtn{height:62px;border-radius:13px;background:var(--panel-2);border:1px solid var(--line);color:var(--ivory);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px}
+  .mbtn b{font-family:'Bricolage Grotesque',sans-serif;font-size:23px;font-weight:800;line-height:1}
+  .mbtn small{font-size:11px;color:var(--muted)}
+  .mbtn:active{transform:scale(.96);background:#234a40}
+  .mbtn.sug{border-color:var(--mint);box-shadow:0 0 0 2px rgba(87,224,191,.3)}
+
+  .namewrap{position:relative;margin-bottom:6px}
+  .modal .namewrap input.name{margin-bottom:0;padding-right:46px}
+  .clearname{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:30px;height:30px;border-radius:50%;
+    background:var(--panel-2);border:1px solid var(--line);color:var(--muted);font-size:20px;line-height:1;
+    display:flex;align-items:center;justify-content:center}
+
   .toast{position:fixed;left:50%;bottom:calc(20px + var(--safe-b));transform:translateX(-50%) translateY(20px);
     background:#222;color:#fff;padding:11px 18px;border-radius:11px;font-size:14px;opacity:0;transition:.2s;pointer-events:none;z-index:60;border:1px solid #3a3a3a}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
@@ -553,7 +595,7 @@ const LS="yahtzee_table_game";
 const $=id=>document.getElementById(id);
 function show(sec){["setup","board"].forEach(s=>$(s).classList.toggle("hidden",s!==sec));$("loading").classList.add("hidden");}
 function toast(m){const t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),1700);}
-function save(){if(editor&&gid&&token&&S){localStorage.setItem(LS,JSON.stringify({id:gid,token,snapshot:{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled}}));}}
+function save(){if(editor&&gid&&token&&S){localStorage.setItem(LS,JSON.stringify({id:gid,token,snapshot:{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,current:S.current}}));}}
 
 function scoreFor(cat,dice){
   const c={};dice.forEach(d=>c[d]=(c[d]||0)+1);
@@ -665,9 +707,9 @@ function renderSheet(){
   let tr=document.createElement("tr");
   tr.innerHTML='<th class="rowlabel">Catégorie</th>';
   S.players.forEach((p,i)=>{
-    const th=document.createElement("th");th.className="phead"+(i===S.leader?" lead":"");
-    th.innerHTML='<span class="crown">'+(i===S.leader?"♛":"")+'</span><span class="nm"></span>';
-    th.querySelector(".nm").textContent=p.name;
+    const th=document.createElement("th");
+    th.className="phead"+(i===S.leader?" lead":"")+(i===S.current?" cur":"");
+    th.innerHTML='<span class="nm">'+(i===S.leader?"♛ ":"")+escapeHtml(p.name)+'</span><span class="turntag">'+(i===S.current?"à jouer":"")+'</span>';
     if(editor)th.onclick=()=>openRename(i);
     tr.appendChild(th);
   });
@@ -680,7 +722,7 @@ function renderSheet(){
     lab.innerHTML=cat.label+'<span class="hint">'+cat.hint+'</span>';
     row.appendChild(lab);
     S.players.forEach((p,i)=>{
-      const td=document.createElement("td");td.className="cell";
+      const td=document.createElement("td");td.className="cell"+(i===S.current?" cur":"");
       const v=p.scores[cat.k];
       if(v!==null&&v!==undefined){td.innerHTML='<span class="v">'+v+'</span>';if(v===0)td.classList.add("zero");}
       else td.innerHTML='<span class="empty">+</span>';
@@ -709,35 +751,60 @@ function renderSheet(){
 /* ---------- saisie d'une case ---------- */
 let cur={player:null,cat:null,buf:""};
 function openCell(player,cat){
+  if(player!==S.current){
+    const p=S.players[player];
+    openModal('<h3>Pas le joueur en cours</h3><div class="sub">'+"C'est à "+escapeHtml(S.players[S.current].name)+" de jouer."+'</div><div class="fixedbtns"><button class="btn primary" data-w="ok">Éditer '+escapeHtml(p.name)+' quand même</button><button class="btn" data-w="cancel">Annuler</button></div>');
+    document.querySelectorAll("#modalRoot [data-w]").forEach(b=>{b.onclick=()=>{const a=b.dataset.w;closeModal();if(a==="ok")openCellEditor(player,cat);};});
+  }else{
+    openCellEditor(player,cat);
+  }
+}
+
+function openCellEditor(player,cat){
   cur={player,cat,buf:""};
   const p=S.players[player], val=p.scores[cat], catMeta=CATS.find(c=>c.k===cat);
   const filled=(val!==null&&val!==undefined);
-  let html='<h3>'+catMeta.label+'</h3><div class="sub">'+escapeHtml(p.name)+(filled?(" · actuel : "+val):"")+'</div>';
+  const head='<h3>'+catMeta.label+'</h3><div class="sub">'+escapeHtml(p.name)+(filled?(" · actuel : "+val):"")+'</div>';
 
+  // section du haut : les multiples du chiffre (0 à 5 dés)
+  if(UPPER.includes(cat)){
+    const n=FACE[cat];
+    const sug=(S.dice_enabled&&S.turn_rolled)?scoreFor(cat,S.dice):-1;
+    let html=head+'<div class="multi">';
+    for(let k=0;k<=5;k++){const v=k*n;html+='<button class="mbtn'+(v===sug?" sug":"")+'" data-v="'+v+'"><b>'+v+'</b><small>'+k+" dé"+(k>1?"s":"")+'</small></button>';}
+    html+='</div><div class="mbtns">';
+    if(filled)html+='<button class="btn danger" data-act="clear">Effacer</button>';
+    html+='<button class="btn" data-act="cancel">Annuler</button></div>';
+    openModal(html);
+    document.querySelectorAll("#modalRoot .mbtn").forEach(b=>{b.onclick=()=>{emit("set_score",{player,category:cat,value:parseInt(b.dataset.v,10)});closeModal();};});
+    document.querySelectorAll("#modalRoot [data-act]").forEach(b=>{b.onclick=()=>{const a=b.dataset.act;if(a==="cancel")closeModal();else if(a==="clear"){emit("set_score",{player,category:cat,value:null});closeModal();}};});
+    return;
+  }
+
+  // cases à valeur fixe
   if(FIXED[cat]){
     const fv=FIXED[cat];
-    html+='<div class="fixedbtns">';
+    let html=head+'<div class="fixedbtns">';
     html+='<button class="btn primary" data-act="fixed">Mettre '+fv+'</button>';
     html+='<button class="btn" data-act="zero">Mettre 0</button>';
     if(filled)html+='<button class="btn danger" data-act="clear">Effacer cette case</button>';
-    html+='<button class="btn" data-act="cancel">Annuler</button>';
-    html+='</div>';
+    html+='<button class="btn" data-act="cancel">Annuler</button></div>';
     openModal(html);
     bindFixed(cat);
-  }else{
-    cur.buf=filled?String(val):"";
-    html+='<div class="display'+(cur.buf?"":" empty")+'" id="disp">'+(cur.buf||"0")+'</div>';
-    if(S.dice_enabled&&S.turn_rolled){const sug=scoreFor(cat,S.dice);html+='<div class="suggest"><button data-act="sug" data-v="'+sug+'">Score des dés : '+sug+'</button></div>';}
-    html+='<div class="keypad" id="kp"></div>';
-    html+='<div class="mbtns">';
-    if(filled)html+='<button class="btn danger" data-act="clear">Effacer</button>';
-    html+='<button class="btn" data-act="cancel">Annuler</button>';
-    html+='<button class="btn primary" data-act="ok">Valider</button>';
-    html+='</div>';
-    openModal(html);
-    buildKeypad();
-    bindNumber();
+    return;
   }
+
+  // brelan, carré, chance : pavé numérique
+  cur.buf=filled?String(val):"";
+  let html=head+'<div class="display'+(cur.buf?"":" empty")+'" id="disp">'+(cur.buf||"0")+'</div>';
+  if(S.dice_enabled&&S.turn_rolled){const sug=scoreFor(cat,S.dice);html+='<div class="suggest"><button data-act="sug" data-v="'+sug+'">Score des dés : '+sug+'</button></div>';}
+  html+='<div class="keypad" id="kp"></div><div class="mbtns">';
+  if(filled)html+='<button class="btn danger" data-act="clear">Effacer</button>';
+  html+='<button class="btn" data-act="cancel">Annuler</button>';
+  html+='<button class="btn primary" data-act="ok">Valider</button></div>';
+  openModal(html);
+  buildKeypad();
+  bindNumber();
 }
 function buildKeypad(){
   const kp=$("kp");kp.innerHTML="";
@@ -779,19 +846,22 @@ function bindFixed(cat){
 function openRename(i){
   const p=S.players[i];
   let html='<h3>Joueur</h3><div class="sub">Modifier le nom</div>';
-  html+='<input class="name" id="nameInp" maxlength="18" value="'+escapeAttr(p.name)+'">';
+  html+='<div class="namewrap"><input class="name" id="nameInp" maxlength="18" value="'+escapeAttr(p.name)+'"><button class="clearname" data-act="clr">×</button></div>';
+  if(i!==S.current)html+='<button class="btn" data-act="turn" style="margin-bottom:10px">'+"C'est à "+escapeHtml(p.name)+" de jouer"+'</button>';
   html+='<div class="mbtns">';
   if(S.players.length>1)html+='<button class="btn danger" data-act="del">Supprimer</button>';
   html+='<button class="btn" data-act="cancel">Annuler</button>';
-  html+='<button class="btn primary" data-act="save">Enregistrer</button>';
-  html+='</div>';
+  html+='<button class="btn primary" data-act="save">Enregistrer</button></div>';
   openModal(html);
-  $("nameInp").focus();
+  const inp=$("nameInp");
+  setTimeout(()=>{inp.focus();inp.select();},60);
   document.querySelectorAll("#modalRoot [data-act]").forEach(b=>{
     const a=b.dataset.act;
     b.onclick=()=>{
       if(a==="cancel")closeModal();
-      else if(a==="save"){const n=$("nameInp").value.trim();if(n)emit("set_name",{player:i,name:n});closeModal();}
+      else if(a==="clr"){inp.value="";inp.focus();}
+      else if(a==="turn"){emit("set_current",{player:i});closeModal();}
+      else if(a==="save"){const n=inp.value.trim();if(n)emit("set_name",{player:i,name:n});closeModal();}
       else if(a==="del"){if(confirm("Supprimer "+p.name+" ?")){emit("remove_player",{player:i});closeModal();}}
     };
   });
