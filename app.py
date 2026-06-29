@@ -12,6 +12,7 @@ Prod   :  gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 
 import os
 import random
 import string
+import time
 from collections import Counter
 
 from flask import Flask, request, Response
@@ -91,14 +92,15 @@ def make_player(name):
     return {"name": name, "scores": {c: None for c in CATEGORIES}}
 
 
-def make_game(gid, token, names, dice_enabled):
+def make_game(gid, names, dice_enabled):
     return {
-        "id": gid, "token": token,
+        "id": gid,
         "players": [make_player(n) for n in names],
         "dice_enabled": bool(dice_enabled),
         "dice": [1, 1, 1, 1, 1], "held": [False] * 5,
         "rolls_left": 3, "turn_rolled": False,
         "current": 0,
+        "updated": time.time(),
     }
 
 
@@ -125,15 +127,14 @@ def serialize(g):
 def broadcast(gid):
     g = games.get(gid)
     if g:
+        g["updated"] = time.time()
         socketio.emit("state", serialize(g), to=gid)
 
 
 def auth(data):
-    """Retourne (game, True) si le token correspond au créateur, sinon (game, False)."""
+    """Tout le monde est admin : il suffit que la partie existe."""
     g = games.get((data or {}).get("id"))
-    if not g:
-        return None, False
-    return g, ((data or {}).get("token") == g["token"])
+    return g, (g is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +146,11 @@ def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
+@app.route("/ping")
+def ping():
+    return Response("ok", mimetype="text/plain")
+
+
 # ---------------------------------------------------------------------------
 # Événements
 # ---------------------------------------------------------------------------
@@ -153,27 +159,28 @@ def index():
 def on_create(data):
     names = data.get("names") or ["Joueur 1"]
     names = [(n or f"Joueur {i+1}").strip()[:18] or f"Joueur {i+1}" for i, n in enumerate(names)][:10]
-    gid, token = new_id(), new_token()
-    games[gid] = make_game(gid, token, names, data.get("dice_enabled"))
+    gid = new_id()
+    games[gid] = make_game(gid, names, data.get("dice_enabled"))
     join_room(gid)
-    emit("created", {"id": gid, "token": token})
-    emit("role", {"editor": True})
+    emit("created", {"id": gid})
     broadcast(gid)
 
 
-@socketio.on("resume")
-def on_resume(data):
+@socketio.on("open_game")
+def on_open(data):
     gid = (data or {}).get("id")
-    token = (data or {}).get("token")
+    if not gid:
+        emit("expired", {})
+        return
     g = games.get(gid)
     if not g:
-        # le serveur a peut-être redémarré : on recrée depuis l'instantané du créateur
+        # serveur redémarré / partie expirée : on recrée depuis l'instantané du client si dispo
         snap = (data or {}).get("snapshot") or {}
         names = [p.get("name", f"Joueur {i+1}") for i, p in enumerate(snap.get("players", []))]
-        if not names or not token or not gid:
-            emit("no_game", {})
+        if not names:
+            emit("expired", {})
             return
-        g = make_game(gid, token, names, snap.get("dice_enabled"))
+        g = make_game(gid, names, snap.get("dice_enabled"))
         for i, p in enumerate(snap.get("players", [])):
             sc = p.get("scores", {})
             for c in CATEGORIES:
@@ -182,32 +189,30 @@ def on_resume(data):
         cu = snap.get("current", 0)
         g["current"] = cu if isinstance(cu, int) and 0 <= cu < len(g["players"]) else 0
         games[gid] = g
-        join_room(gid)
-        emit("role", {"editor": True})
-        broadcast(gid)
-        return
     join_room(gid)
-    emit("role", {"editor": token == g["token"]})
     emit("state", serialize(g))
 
 
-@socketio.on("join_game")
-def on_join(data):
-    gid = (data or {}).get("id")
-    g = games.get(gid)
-    if not g:
-        emit("no_game", {})
-        return
-    join_room(gid)
-    emit("role", {"editor": False})
-    emit("state", serialize(g))
+@socketio.on("list_games")
+def on_list(data=None):
+    items = []
+    for gid, g in games.items():
+        filled = sum(1 for p in g["players"] for c in CATEGORIES if p["scores"][c] is not None)
+        items.append({
+            "id": gid,
+            "players": [p["name"] for p in g["players"]],
+            "filled": filled,
+            "total": len(g["players"]) * len(CATEGORIES),
+            "updated": g.get("updated", 0),
+        })
+    items.sort(key=lambda x: x["updated"], reverse=True)
+    emit("games_list", {"games": items[:12]})
 
 
 @socketio.on("set_score")
 def on_set_score(data):
     g, ok = auth(data)
     if not ok:
-        emit("denied")
         return
     i = data.get("player")
     cat = data.get("category")
@@ -504,6 +509,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .toast{position:fixed;left:50%;bottom:calc(20px + var(--safe-b));transform:translateX(-50%) translateY(20px);
     background:#222;color:#fff;padding:11px 18px;border-radius:11px;font-size:14px;opacity:0;transition:.2s;pointer-events:none;z-index:60;border:1px solid #3a3a3a}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .ongoing-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .linkbtn{background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:9px;width:34px;height:34px;font-size:16px}
+  .gamerow{width:100%;display:flex;align-items:center;gap:10px;background:var(--bg-0);border:1px solid var(--line);
+    border-radius:11px;padding:12px 13px;color:var(--ivory);text-align:left;margin-bottom:8px;transition:transform .08s}
+  .gamerow:last-child{margin-bottom:0}
+  .gamerow:active{transform:scale(.99)}
+  .gamerow .gi{min-width:0;flex:1}
+  .gamerow .gn{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .gamerow .gp{font-size:12px;color:var(--muted);margin-top:2px}
+  .gamerow .join{color:var(--gold);font-weight:600;font-size:14px;flex:none}
+  .btn.resume{display:flex;flex-direction:column;align-items:flex-start;gap:1px;margin-bottom:14px;text-align:left}
+  .btn.resume small{font-weight:400;color:#6b551a;font-size:12px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
   @media (prefers-reduced-motion:reduce){.die.rolling{animation:none}}
 </style>
 </head>
@@ -514,10 +532,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <h1>YAH<b>TZEE</b></h1>
   </div>
 
-  <!-- ============ SETUP ============ -->
+  <!-- ============ ACCUEIL ============ -->
   <section id="setup" class="hidden">
+    <div id="resumeWrap"></div>
+    <div class="card hidden" id="ongoingCard" style="padding-bottom:12px">
+      <div class="ongoing-head">
+        <span class="fld" style="margin:0">Parties en cours</span>
+        <button id="refreshGames" class="linkbtn" title="Rafraîchir">↻</button>
+      </div>
+      <div id="gamesList"></div>
+    </div>
     <div class="card">
-      <p class="lead">Feuille de score pour la table. Tu tiens les scores, les autres peuvent suivre en lecture seule via le lien.</p>
+      <p class="lead">Nouvelle partie — feuille de score pour la table. Partage le lien : tout le monde saisit les scores depuis son téléphone, sur la même feuille.</p>
       <span class="fld">Nombre de joueurs</span>
       <div class="stepper">
         <button id="minus">−</button>
@@ -526,11 +552,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <span class="fld">Noms (modifiables)</span>
       <div class="names" id="names"></div>
-      <div class="toggle-row">
-        <div class="t">Dés virtuels<small>Optionnel — sinon dés réels sur la table</small></div>
-        <div class="sw" id="diceSw"></div>
-      </div>
-      <button class="btn primary" id="btnStart">Commencer</button>
+      <button class="btn primary" id="btnStart" style="margin-top:16px">Commencer</button>
     </div>
   </section>
 
@@ -540,13 +562,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div>
         <div class="tt">Feuille de <b>score</b></div>
       </div>
-      <span class="role" id="roleBadge"></span>
       <button class="iconbtn" id="btnShare" title="Partager"><svg viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg></button>
-      <button class="iconbtn editonly" id="btnDice" title="Dés"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.3" fill="currentColor" stroke="none"/></svg></button>
-      <button class="iconbtn editonly" id="btnMenu" title="Menu"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.4" fill="currentColor" stroke="none"/></svg></button>
+      <button class="iconbtn" id="btnDice" title="Dés"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.3" fill="currentColor" stroke="none"/></svg></button>
+      <button class="iconbtn" id="btnMenu" title="Menu"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.4" fill="currentColor" stroke="none"/></svg></button>
     </div>
-
-    <div class="viewbanner hidden" id="viewBanner">Lecture seule — seul le créateur peut modifier les scores.</div>
 
     <div class="dicepanel hidden" id="dicePanel">
       <div class="dice" id="dice"></div>
@@ -565,7 +584,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="foot">Touche une case pour saisir · bonus +35 dès 63 en haut</div>
   </section>
 
-  <div class="foot" id="loading">Connexion…</div>
+  <div class="foot" id="loading">Connexion à la partie…</div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -573,7 +592,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
 const socket = io({transports:["websocket","polling"]});
-let S=null, editor=false, gid=null, token=null;
+let S=null, gid=null;
 let prevDice=[1,1,1,1,1], prevRolled=false;
 
 const CATS=[
@@ -601,7 +620,7 @@ const $=id=>document.getElementById(id);
 function show(sec){["setup","board"].forEach(s=>$(s).classList.toggle("hidden",s!==sec));$("loading").classList.add("hidden");}
 function toast(m){const t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),1700);}
 function readStored(){try{return JSON.parse(localStorage.getItem(LS)||"null");}catch(e){return null;}}
-function save(){if(token&&gid){localStorage.setItem(LS,JSON.stringify({id:gid,token,snapshot:S?{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,current:S.current}:null}));}}
+function save(){if(gid){localStorage.setItem(LS,JSON.stringify({id:gid,snapshot:S?{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,current:S.current}:((readStored()||{}).snapshot||null)}));}}
 
 function scoreFor(cat,dice){
   const c={};dice.forEach(d=>c[d]=(c[d]||0)+1);
@@ -618,43 +637,78 @@ function scoreFor(cat,dice){
 }
 
 /* ---------- identité / connexion ----------
-   Être éditeur = posséder le jeton secret de la partie (stocké sur l'appareil).
-   On le ré-affirme à chaque (re)connexion et au retour de page (précédent/
-   suivant), pour ne jamais retomber en lecture seule par accident. */
+   Tout le monde est admin : il suffit d'avoir le lien de la partie.
+   Chaque appareil garde une copie locale ; à la (re)connexion il l'envoie
+   pour restaurer la partie si le serveur a redémarré. */
 function identify(){
   const g=new URLSearchParams(location.search).get("game");
-  const stored=readStored();
-  if(g){
-    if(stored&&stored.id===g){gid=g;token=stored.token;socket.emit("resume",stored);}
-    else{gid=g;token=null;socket.emit("join_game",{id:g});}
-  }else if(stored){
-    gid=stored.id;token=stored.token;socket.emit("resume",stored);
-  }else{
-    openSetup();
-  }
-  editor=!!token;
+  if(g){const stored=readStored();gid=g;socket.emit("open_game",{id:g,snapshot:(stored&&stored.id===g)?stored.snapshot:null});}
+  else openSetup();
 }
 function setOnline(on){
   let el=$("offlinebar");
   if(!el){el=document.createElement("div");el.id="offlinebar";el.className="offlinebar";el.textContent="Reconnexion…";document.body.appendChild(el);}
   el.classList.toggle("show",!on);
 }
+function openExpired(){
+  openModal('<h3>Partie introuvable</h3><div class="sub">'+"Le serveur s'est sûrement remis en veille et l'a oubliée. Si quelqu'un l'a encore ouverte, demande-lui de rafraîchir la page — ça la restaurera pour tout le monde. Sinon, crée-en une nouvelle."+'</div><div class="fixedbtns"><button class="btn" data-x="retry">Réessayer</button><button class="btn primary" data-x="new">Nouvelle partie</button></div>');
+  document.querySelectorAll("#modalRoot [data-x]").forEach(b=>{b.onclick=()=>{const a=b.dataset.x;closeModal();if(a==="retry")identify();else{localStorage.removeItem(LS);history.replaceState(null,"",location.pathname);gid=null;S=null;openSetup();}};});
+}
 
 socket.on("connect",()=>{setOnline(true);identify();});
 socket.on("disconnect",()=>setOnline(false));
-socket.on("created",d=>{gid=d.id;token=d.token;editor=true;history.replaceState(null,"","?game="+gid);save();});
-socket.on("role",d=>{editor=!!token||!!d.editor;if(S)render();});
-socket.on("denied",()=>{const stored=readStored();if(stored&&stored.id===gid)socket.emit("resume",stored);});
-socket.on("no_game",()=>{toast("Partie introuvable");localStorage.removeItem(LS);history.replaceState(null,"",location.pathname);editor=false;token=null;openSetup();});
-socket.on("state",s=>{S=s;if(!gid)gid=s.id;editor=!!token;save();render();});
+socket.on("created",d=>{gid=d.id;history.replaceState(null,"","?game="+gid);save();});
+let expiredTries=0;
+socket.on("expired",()=>{
+  // un autre téléphone encore connecté peut être en train de la restaurer : on réessaie
+  if(expiredTries<6){expiredTries++;setOnline(false);setTimeout(()=>{setOnline(true);identify();},5000);}
+  else{expiredTries=0;openExpired();}
+});
+socket.on("state",s=>{expiredTries=0;S=s;if(!gid)gid=s.id;save();render();});
+
+/* garder le serveur réveillé pendant qu'on joue (Render s'endort sans trafic) */
+setInterval(()=>{if(document.visibilityState==="visible")fetch("/ping",{cache:"no-store"}).catch(()=>{});},9*60*1000);
 
 /* retour précédent/suivant (page restaurée depuis le cache) */
 window.addEventListener("pageshow",e=>{if(e.persisted){if(socket.connected)identify();else socket.connect();}});
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&!socket.connected)socket.connect();});
 
 /* ---------- SETUP ---------- */
-let nPlayers=4, diceOn=false;
-function openSetup(){show("setup");buildNames();$("diceSw").classList.toggle("on",diceOn);}
+let nPlayers=4;
+function openSetup(){show("setup");buildNames();renderResume();fetchGames();}
+
+function fetchGames(){if(socket.connected)socket.emit("list_games",{});}
+socket.on("games_list",d=>renderGames(d.games||[]));
+function renderGames(list){
+  const stored=readStored();
+  list=list.filter(g=>!(stored&&stored.id===g.id));
+  const card=$("ongoingCard"),box=$("gamesList");
+  if(!list.length){card.classList.add("hidden");return;}
+  card.classList.remove("hidden");box.innerHTML="";
+  list.forEach(g=>{
+    const row=document.createElement("button");row.className="gamerow";
+    row.innerHTML='<div class="gi"><div class="gn"></div><div class="gp">'+g.filled+"/"+g.total+' cases remplies</div></div><span class="join">Rejoindre →</span>';
+    row.querySelector(".gn").textContent=g.players.join(", ")||"Partie";
+    row.onclick=()=>joinGame(g.id);
+    box.appendChild(row);
+  });
+}
+function renderResume(){
+  const w=$("resumeWrap");w.innerHTML="";const stored=readStored();
+  if(stored&&stored.id&&stored.snapshot&&stored.snapshot.players&&stored.snapshot.players.length){
+    const names=stored.snapshot.players.map(p=>p.name).join(", ");
+    const b=document.createElement("button");b.className="btn primary resume";
+    b.innerHTML="Reprendre ma partie<small></small>";
+    b.querySelector("small").textContent=names;
+    b.onclick=()=>joinGame(stored.id);
+    w.appendChild(b);
+  }
+}
+function joinGame(id){
+  const stored=readStored();gid=id;
+  history.replaceState(null,"","?game="+id);
+  socket.emit("open_game",{id,snapshot:(stored&&stored.id===id)?stored.snapshot:null});
+}
 function buildNames(){
   const box=$("names");const old={};box.querySelectorAll("input").forEach((inp,i)=>old[i]=inp.value);
   box.innerHTML="";
@@ -668,21 +722,17 @@ function buildNames(){
 }
 $("minus").onclick=()=>{if(nPlayers>1){nPlayers--;$("np").textContent=nPlayers;buildNames();}};
 $("plus").onclick=()=>{if(nPlayers<10){nPlayers++;$("np").textContent=nPlayers;buildNames();}};
-$("diceSw").onclick=()=>{diceOn=!diceOn;$("diceSw").classList.toggle("on",diceOn);};
 $("btnStart").onclick=()=>{
   const names=[...$("names").querySelectorAll("input")].map((inp,i)=>inp.value.trim()||("Joueur "+(i+1)));
   localStorage.removeItem(LS);
-  socket.emit("create_game",{names,dice_enabled:diceOn});
+  socket.emit("create_game",{names,dice_enabled:false});
 };
+$("refreshGames").onclick=fetchGames;
 
 /* ---------- BOARD ---------- */
 function render(){
   if(!S)return;
   show("board");
-  $("roleBadge").textContent=editor?"éditeur":"lecture seule";
-  $("roleBadge").className="role "+(editor?"edit":"view");
-  $("viewBanner").classList.toggle("hidden",editor);
-  document.querySelectorAll(".editonly").forEach(e=>e.classList.toggle("hidden",!editor));
 
   // dés
   const dp=$("dicePanel");
@@ -708,7 +758,7 @@ function renderDice(){
     const d=dieEl(v,i);
     if(S.held[i])d.classList.add("held");
     if(!S.turn_rolled)d.classList.add("idle");
-    if(editor&&S.turn_rolled&&S.rolls_left>0)d.onclick=()=>emit("toggle_hold",{index:i});
+    if(S.turn_rolled&&S.rolls_left>0)d.onclick=()=>emit("toggle_hold",{index:i});
     if(S.turn_rolled&&prevRolled&&v!==prevDice[i]&&!S.held[i]){d.classList.add("rolling");d.style.animationDelay=(i*40)+"ms";}
     box.appendChild(d);
   });
@@ -719,8 +769,6 @@ function renderDice(){
   t.textContent=S.turn_rolled?(S.rolls_left+" lancer"+(S.rolls_left>1?"s":"")+" restant"+(S.rolls_left>1?"s":"")):"3 lancers";
   r.appendChild(t);
   $("btnRoll").textContent=!S.turn_rolled?"Lancer les dés":(S.rolls_left>0?"Relancer ("+S.rolls_left+")":"Nouveau tour");
-  $("btnRoll").disabled=!editor;
-  $("btnResetDice").disabled=!editor;
 }
 
 function renderSheet(){
@@ -732,7 +780,7 @@ function renderSheet(){
     const th=document.createElement("th");
     th.className="phead"+(i===S.leader?" lead":"")+(i===S.current?" cur":"");
     th.innerHTML='<span class="nm">'+(i===S.leader?"♛ ":"")+escapeHtml(p.name)+'</span><span class="turntag">'+(i===S.current?"à jouer":"")+'</span>';
-    if(editor)th.onclick=()=>openRename(i);
+    th.onclick=()=>openRename(i);
     tr.appendChild(th);
   });
   thead.appendChild(tr);t.appendChild(thead);
@@ -748,7 +796,7 @@ function renderSheet(){
       const v=p.scores[cat.k];
       if(v!==null&&v!==undefined){td.innerHTML='<span class="v">'+v+'</span>';if(v===0)td.classList.add("zero");}
       else td.innerHTML='<span class="empty">+</span>';
-      if(editor){td.classList.add("editable");td.onclick=()=>openCell(i,cat.k);}
+      td.classList.add("editable");td.onclick=()=>openCell(i,cat.k);
       row.appendChild(td);
     });
     tb.appendChild(row);
@@ -764,10 +812,28 @@ function renderSheet(){
 
   CATS.slice(0,6).forEach(c=>addCatRow(c));
   addTotalRow("Total (haut)",p=>p.totals.upper,"sub");
-  addTotalRow("Bonus",p=>p.totals.bonus>0?"+35":(p.totals.upper+"/63"),"sub",true);
+  addBonusRow(tb);
   CATS.slice(6).forEach((c,i)=>addCatRow(c,i===0?"sep":""));
   addTotalRow("TOTAL",p=>p.totals.total,"total sep");
   t.appendChild(tb);
+}
+
+function addBonusRow(tb){
+  const row=document.createElement("tr");row.className="sub bonusrow";
+  const lab=document.createElement("td");lab.className="rowlabel";
+  lab.innerHTML='Bonus <span class="bonus-mini">(+35 dès 63)</span>';
+  row.appendChild(lab);
+  S.players.forEach((p,i)=>{
+    const td=document.createElement("td");td.className="cell"+(i===S.current?" cur":"");
+    if(p.totals.bonus>0){
+      td.innerHTML='<span class="v" style="color:var(--mint)">+35 ✓</span>';
+    }else{
+      const reste=Math.max(0,63-p.totals.upper);
+      td.innerHTML='<span class="v">'+p.totals.upper+'/63</span><span class="bonus-mini" style="display:block">reste '+reste+'</span>';
+    }
+    row.appendChild(td);
+  });
+  tb.appendChild(row);
 }
 
 /* ---------- saisie d'une case ---------- */
@@ -893,7 +959,8 @@ function openRename(i){
 $("btnMenu").onclick=()=>{
   let html='<h3>Menu</h3><div class="fixedbtns">';
   html+='<button class="btn" data-m="add">Ajouter un joueur</button>';
-  html+='<button class="btn" data-m="share">Copier le lien (lecture seule)</button>';
+  html+='<button class="btn" data-m="share">Copier le lien de la partie</button>';
+  html+='<button class="btn" data-m="home">Accueil / autre partie</button>';
   html+='<button class="btn danger" data-m="new">Nouvelle partie</button>';
   html+='<button class="btn" data-m="close">Fermer</button>';
   html+='</div>';
@@ -903,6 +970,7 @@ $("btnMenu").onclick=()=>{
       const m=b.dataset.m;closeModal();
       if(m==="add")emit("add_player",{});
       else if(m==="share")shareLink();
+      else if(m==="home"){history.replaceState(null,"",location.pathname);gid=null;S=null;openSetup();}
       else if(m==="new"){if(confirm("Démarrer une nouvelle partie ? La feuille actuelle sera quittée.")){localStorage.removeItem(LS);location.href=location.pathname;}}
     };
   });
@@ -930,7 +998,7 @@ function openModal(html){
 function closeModal(){const r=$("modalRoot");if(r)r.innerHTML="";}
 
 /* ---------- util ---------- */
-function emit(ev,data){socket.emit(ev,Object.assign({id:gid,token},data));}
+function emit(ev,data){socket.emit(ev,Object.assign({id:gid},data));}
 function escapeHtml(s){return (s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 function escapeAttr(s){return (s||"").replace(/"/g,"&quot;").replace(/</g,"&lt;");}
 </script>
