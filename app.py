@@ -650,24 +650,22 @@ function setOnline(on){
   if(!el){el=document.createElement("div");el.id="offlinebar";el.className="offlinebar";el.textContent="Reconnexion…";document.body.appendChild(el);}
   el.classList.toggle("show",!on);
 }
-function openExpired(){
-  openModal('<h3>Partie introuvable</h3><div class="sub">'+"Le serveur s'est sûrement remis en veille et l'a oubliée. Si quelqu'un l'a encore ouverte, demande-lui de rafraîchir la page — ça la restaurera pour tout le monde. Sinon, crée-en une nouvelle."+'</div><div class="fixedbtns"><button class="btn" data-x="retry">Réessayer</button><button class="btn primary" data-x="new">Nouvelle partie</button></div>');
-  document.querySelectorAll("#modalRoot [data-x]").forEach(b=>{b.onclick=()=>{const a=b.dataset.x;closeModal();if(a==="retry")identify();else{localStorage.removeItem(LS);history.replaceState(null,"",location.pathname);gid=null;S=null;openSetup();}};});
-}
-
 socket.on("connect",()=>{setOnline(true);identify();});
 socket.on("disconnect",()=>setOnline(false));
 socket.on("created",d=>{gid=d.id;history.replaceState(null,"","?game="+gid);save();});
-let expiredTries=0;
 socket.on("expired",()=>{
-  // un autre téléphone encore connecté peut être en train de la restaurer : on réessaie
-  if(expiredTries<6){expiredTries++;setOnline(false);setTimeout(()=>{setOnline(true);identify();},5000);}
-  else{expiredTries=0;openExpired();}
+  // la partie n'existe plus (serveur en veille) : retour à l'accueil, jamais de page vide
+  toast("Cette partie n'existe plus");
+  history.replaceState(null,"",location.pathname);
+  gid=null;S=null;
+  openSetup();
 });
-socket.on("state",s=>{expiredTries=0;S=s;if(!gid)gid=s.id;save();render();});
+socket.on("state",s=>{S=s;if(!gid)gid=s.id;save();render();});
 
 /* garder le serveur réveillé pendant qu'on joue (Render s'endort sans trafic) */
 setInterval(()=>{if(document.visibilityState==="visible")fetch("/ping",{cache:"no-store"}).catch(()=>{});},9*60*1000);
+/* rafraîchir la liste des parties tant qu'on est sur l'accueil */
+setInterval(()=>{const s=$("setup");if(s&&!s.classList.contains("hidden"))fetchGames();},6000);
 
 /* retour précédent/suivant (page restaurée depuis le cache) */
 window.addEventListener("pageshow",e=>{if(e.persisted){if(socket.connected)identify();else socket.connect();}});
