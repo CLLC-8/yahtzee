@@ -721,12 +721,12 @@ const CATS_UPPER=[
   {k:"six",label:"Six",hint:"somme des 6"},
 ];
 const CATS_MM=[
-  {k:"maxi",label:"Maxi",hint:"somme des dés · viser haut"},
-  {k:"mini",label:"Mini",hint:"somme des dés · viser bas"},
+  {k:"maxi",label:"Maxi",hint:"somme des dés<br>· viser haut"},
+  {k:"mini",label:"Mini",hint:"somme des dés<br>· viser bas"},
 ];
 const CATS_LOWER=[
-  {k:"brelan",label:"Brelan",hint:"3 identiques · somme"},
-  {k:"carre",label:"Carré",hint:"4 identiques · somme"},
+  {k:"brelan",label:"Brelan",hint:"3 identiques ·<br>somme des dés"},
+  {k:"carre",label:"Carré",hint:"4 identiques ·<br>somme des dés"},
   {k:"full",label:"Full",hint:"25 pts"},
   {k:"petite_suite",label:"Petite suite",hint:"30 pts"},
   {k:"grande_suite",label:"Grande suite",hint:"40 pts"},
@@ -1029,7 +1029,7 @@ function renderSheet(){
   if(S.minimax){
     addCatRow(CATS_MM[0],"sep");
     addCatRow(CATS_MM[1]);
-    addTotalRow('Écart × As <span class="bonus-mini">(Maxi − Mini) × nb de 1</span>',(p,j)=>{
+    addTotalRow('Écart × As<span class="bonus-mini" style="display:block">(Max − Min) × As</span>',(p,j)=>{
       const s=p.scores[j], ma=s.maxi, mi=s.mini;
       if(ma===null||ma===undefined||mi===null||mi===undefined)return "—";
       const d=Math.max(0,ma-mi);
@@ -1059,7 +1059,7 @@ function renderSheet(){
 function addBonusRow(tb,multi){
   const row=document.createElement("tr");row.className="sub bonusrow";
   const lab=document.createElement("td");lab.className="rowlabel";
-  lab.innerHTML='Bonus <span class="bonus-mini">(+35 dès 63)</span>';
+  lab.innerHTML='Bonus<span class="bonus-mini" style="display:block">(+35 dès 63)</span>';
   row.appendChild(lab);
   S.players.forEach((p,i)=>{
     S.columns.forEach((m,j)=>{
