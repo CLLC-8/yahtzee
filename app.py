@@ -536,7 +536,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .cell.editable:active{background:rgba(240,181,61,.12)}
   .cell .v{font-weight:600}
   .cell .empty{color:var(--muted-2);font-size:18px}
-  .cell.next .empty{color:var(--gold);font-weight:600}
   .cell .lockdot{color:var(--muted-2);opacity:.45;font-size:18px}
   .cell.zero .v{color:var(--muted)}
   tr.sep td,tr.sep th{border-top:2px solid var(--line)}
@@ -590,10 +589,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .modal input.name:focus{border-color:var(--gold)}
 
   .turntag{display:block;height:14px;line-height:14px;font-size:10px;color:var(--gold);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-  .phead.cur{background:rgba(240,181,61,.12)}
+  .phead.cur{background:rgba(240,181,61,.2)}
   .phead.cur .nm{color:var(--gold)}
-  .cell.cur{background:rgba(240,181,61,.06)}
-  .cell.cur.editable:active{background:rgba(240,181,61,.18)}
+  .cell.cur{background:rgba(240,181,61,.12)}
+  .cell.cur.editable:active{background:rgba(240,181,61,.26)}
 
   .multi{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:4px}
   .mbtn{height:62px;border-radius:13px;background:var(--panel-2);border:1px solid var(--line);color:var(--ivory);
@@ -998,7 +997,6 @@ function renderSheet(){
             td.innerHTML='<span class="lockdot">·</span>';
             td.onclick=()=>toast("Colonne "+COL_LABELS[m]+" — case suivante : "+labelOf(nxt));
           }else{
-            if(nxt)td.classList.add("next");
             td.innerHTML='<span class="empty">+</span>';
             td.classList.add("editable");td.onclick=()=>openCell(i,j,cat.k);
           }
