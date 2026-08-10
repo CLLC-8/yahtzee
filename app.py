@@ -542,15 +542,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
   tr.total .rowlabel{font-size:15px}
   .bonus-mini{font-size:10px;color:var(--muted-2);font-weight:400}
 
-  /* mode multi-colonnes */
+  /* mode multi-colonnes (classe "multicol" : ne pas réutiliser ".multi",
+     déjà prise par la grille de boutons de la modale) */
   .psep{border-left:2px solid var(--line)}
   .colhead{font-size:10px;color:var(--muted);font-weight:600;padding:4px 3px !important;
     min-width:48px;text-transform:uppercase;letter-spacing:.03em}
-  table.sheet.multi thead tr:first-child th{height:47px}
-  table.sheet.multi thead tr:nth-child(2) th{top:47px}
-  table.sheet.multi .cell{min-width:48px;font-size:14px;height:42px}
-  table.sheet.multi tr.total .cell{font-size:17px}
-  table.sheet.multi .phead{min-width:0}
+  table.sheet.multicol thead tr:first-child th.phead{height:47px}
+  table.sheet.multicol thead tr:nth-child(2) th{top:47px}
+  table.sheet.multicol .cell{min-width:48px;font-size:14px;height:42px}
+  table.sheet.multicol tr.total .cell{font-size:17px}
+  table.sheet.multicol .phead{min-width:0}
 
   .donebar{margin-top:12px;text-align:center;background:linear-gradient(180deg,rgba(240,181,61,.16),rgba(240,181,61,.04));
     border:1px solid var(--gold);border-radius:12px;padding:13px;font-weight:600}
@@ -940,7 +941,7 @@ function renderDice(){
 function renderSheet(){
   const t=$("sheet");t.innerHTML="";
   const nCols=S.columns.length, multi=nCols>1;
-  t.className="sheet"+(multi?" multi":"");
+  t.className="sheet"+(multi?" multicol":"");
 
   const thead=document.createElement("thead");
   const tr1=document.createElement("tr");
