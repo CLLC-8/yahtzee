@@ -5,6 +5,10 @@ Concept : une personne (le créateur) tient la feuille de score sur son téléph
 Les autres ouvrent le même lien et regardent en LECTURE SEULE (pas de code).
 Saisie manuelle des scores (dés réels) ; dés virtuels en option.
 
+Options à la création :
+ - Mini & Maxi : 2 cases (somme des dés) ; l'écart (Maxi − Mini) s'ajoute au total.
+ - Ordre de remplissage : désordre (libre), ordre (haut → bas), ordre inversé (bas → haut).
+
 Lancer :  python app.py   ->  http://localhost:5000
 Prod   :  gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 --bind 0.0.0.0:$PORT app:app
 """
@@ -28,9 +32,14 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 UPPER = {"un": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "six": 6}
 UPPER_CATS = ["un", "deux", "trois", "quatre", "cinq", "six"]
+MID_CATS = ["maxi", "mini"]  # optionnel (option Mini & Maxi)
 LOWER_CATS = ["brelan", "carre", "full", "petite_suite", "grande_suite", "yahtzee", "chance"]
-CATEGORIES = UPPER_CATS + LOWER_CATS
 FIXED = {"full": 25, "petite_suite": 30, "grande_suite": 40, "yahtzee": 50}
+ORDER_MODES = ("free", "down", "up")
+
+
+def game_categories(minimax):
+    return UPPER_CATS + (MID_CATS if minimax else []) + LOWER_CATS
 
 
 def score_for(category, dice):
@@ -40,6 +49,8 @@ def score_for(category, dice):
     counts = c.values()
     if category in UPPER:
         return c[UPPER[category]] * UPPER[category]
+    if category in ("maxi", "mini"):
+        return total
     if category == "brelan":
         return total if max(counts) >= 3 else 0
     if category == "carre":
@@ -59,14 +70,30 @@ def score_for(category, dice):
     return 0
 
 
-def totals(player):
+def totals(g, player):
     s = player["scores"]
     upper = sum(s[c] or 0 for c in UPPER_CATS)
     bonus = 35 if upper >= 63 else 0
     lower = sum(s[c] or 0 for c in LOWER_CATS)
-    return {"upper": upper, "bonus": bonus, "lower": lower,
-            "total": upper + bonus + lower,
-            "complete": all(s[c] is not None for c in CATEGORIES)}
+    ecart = 0
+    if g["minimax"]:
+        mi, ma = s.get("mini"), s.get("maxi")
+        if mi is not None and ma is not None:
+            ecart = max(0, ma - mi)  # 0 si Maxi < Mini
+    return {"upper": upper, "bonus": bonus, "lower": lower, "ecart": ecart,
+            "total": upper + bonus + lower + ecart,
+            "complete": all(s[c] is not None for c in g["categories"])}
+
+
+def next_required(g, idx):
+    """Prochaine case imposée pour un joueur (None si mode libre ou feuille finie)."""
+    if g["order_mode"] == "free":
+        return None
+    cats = g["categories"] if g["order_mode"] == "down" else list(reversed(g["categories"]))
+    for c in cats:
+        if g["players"][idx]["scores"][c] is None:
+            return c
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -88,14 +115,20 @@ def new_token():
     return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(24))
 
 
-def make_player(name):
-    return {"name": name, "scores": {c: None for c in CATEGORIES}}
+def make_player(name, cats):
+    return {"name": name, "scores": {c: None for c in cats}}
 
 
-def make_game(gid, names, dice_enabled):
+def make_game(gid, names, dice_enabled, minimax=False, order_mode="free"):
+    if order_mode not in ORDER_MODES:
+        order_mode = "free"
+    cats = game_categories(bool(minimax))
     return {
         "id": gid,
-        "players": [make_player(n) for n in names],
+        "players": [make_player(n, cats) for n in names],
+        "minimax": bool(minimax),
+        "order_mode": order_mode,
+        "categories": cats,
         "dice_enabled": bool(dice_enabled),
         "dice": [1, 1, 1, 1, 1], "held": [False] * 5,
         "rolls_left": 3, "turn_rolled": False,
@@ -105,7 +138,8 @@ def make_game(gid, names, dice_enabled):
 
 
 def serialize(g):
-    ps = [{"name": p["name"], "scores": p["scores"], "totals": totals(p)} for p in g["players"]]
+    ps = [{"name": p["name"], "scores": p["scores"], "totals": totals(g, p),
+           "next": next_required(g, i)} for i, p in enumerate(g["players"])]
     complete = bool(ps) and all(p["totals"]["complete"] for p in ps)
     leader = -1
     best = -1
@@ -117,6 +151,7 @@ def serialize(g):
         leader = -1
     return {
         "id": g["id"], "players": ps,
+        "minimax": g["minimax"], "order_mode": g["order_mode"],
         "dice_enabled": g["dice_enabled"],
         "dice": g["dice"], "held": g["held"],
         "rolls_left": g["rolls_left"], "turn_rolled": g["turn_rolled"],
@@ -160,7 +195,8 @@ def on_create(data):
     names = data.get("names") or ["Joueur 1"]
     names = [(n or f"Joueur {i+1}").strip()[:18] or f"Joueur {i+1}" for i, n in enumerate(names)][:10]
     gid = new_id()
-    games[gid] = make_game(gid, names, data.get("dice_enabled"))
+    games[gid] = make_game(gid, names, data.get("dice_enabled"),
+                           data.get("minimax"), data.get("order_mode") or "free")
     join_room(gid)
     emit("created", {"id": gid})
     broadcast(gid)
@@ -180,10 +216,11 @@ def on_open(data):
         if not names:
             emit("expired", {})
             return
-        g = make_game(gid, names, snap.get("dice_enabled"))
+        g = make_game(gid, names, snap.get("dice_enabled"),
+                      snap.get("minimax"), snap.get("order_mode") or "free")
         for i, p in enumerate(snap.get("players", [])):
             sc = p.get("scores", {})
-            for c in CATEGORIES:
+            for c in g["categories"]:
                 v = sc.get(c)
                 g["players"][i]["scores"][c] = v if isinstance(v, int) else None
         cu = snap.get("current", 0)
@@ -197,12 +234,12 @@ def on_open(data):
 def on_list(data=None):
     items = []
     for gid, g in games.items():
-        filled = sum(1 for p in g["players"] for c in CATEGORIES if p["scores"][c] is not None)
+        filled = sum(1 for p in g["players"] for c in g["categories"] if p["scores"][c] is not None)
         items.append({
             "id": gid,
             "players": [p["name"] for p in g["players"]],
             "filled": filled,
-            "total": len(g["players"]) * len(CATEGORIES),
+            "total": len(g["players"]) * len(g["categories"]),
             "updated": g.get("updated", 0),
         })
     items.sort(key=lambda x: x["updated"], reverse=True)
@@ -217,12 +254,15 @@ def on_set_score(data):
     i = data.get("player")
     cat = data.get("category")
     val = data.get("value")
-    if not isinstance(i, int) or i < 0 or i >= len(g["players"]) or cat not in CATEGORIES:
+    if not isinstance(i, int) or i < 0 or i >= len(g["players"]) or cat not in g["categories"]:
         return
     if val is None:
         g["players"][i]["scores"][cat] = None
     elif isinstance(val, (int, float)):
         was = g["players"][i]["scores"][cat]
+        # ordre imposé : une case vide ne peut être remplie que si c'est la suivante
+        if was is None and g["order_mode"] != "free" and cat != next_required(g, i):
+            return
         g["players"][i]["scores"][cat] = max(0, min(999, int(val)))
         # quand le joueur en cours remplit une case vide -> au suivant
         if was is None and i == g["current"]:
@@ -258,7 +298,7 @@ def on_add_player(data):
     g, ok = auth(data)
     if not ok or len(g["players"]) >= 10:
         return
-    g["players"].append(make_player(f"Joueur {len(g['players'])+1}"))
+    g["players"].append(make_player(f"Joueur {len(g['players'])+1}", g["categories"]))
     broadcast(g["id"])
 
 
@@ -382,10 +422,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .toggle-row{display:flex;align-items:center;justify-content:space-between;background:var(--bg-0);
     border:1px solid var(--line);border-radius:12px;padding:13px 14px;margin:16px 0}
   .toggle-row .t{font-weight:500}.toggle-row .t small{display:block;color:var(--muted);font-size:12.5px;font-weight:400;margin-top:2px}
-  .sw{width:52px;height:30px;border-radius:30px;background:var(--line);position:relative;transition:background .15s;flex:none}
+  .sw{width:52px;height:30px;border-radius:30px;background:var(--line);position:relative;transition:background .15s;flex:none;cursor:pointer}
   .sw.on{background:var(--gold)}
   .sw::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:var(--ivory);transition:left .15s}
   .sw.on::after{left:25px}
+
+  .seg{display:flex;gap:8px;margin-bottom:16px}
+  .seg button{flex:1;padding:10px 4px;border-radius:11px;background:var(--bg-0);border:1px solid var(--line);
+    color:var(--muted);font-size:13.5px;font-weight:600;line-height:1.2}
+  .seg button small{display:block;font-size:10.5px;font-weight:400;margin-top:3px;color:var(--muted-2)}
+  .seg button.on{background:rgba(240,181,61,.13);border-color:var(--gold);color:var(--gold)}
+  .seg button.on small{color:var(--gold-deep)}
 
   .btn{width:100%;padding:15px;border-radius:12px;font-weight:600;background:var(--panel-2);color:var(--ivory);border:1px solid var(--line);transition:transform .08s}
   .btn:active{transform:scale(.985)}
@@ -443,6 +490,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .cell.editable:active{background:rgba(240,181,61,.12)}
   .cell .v{font-weight:600}
   .cell .empty{color:var(--muted-2);font-size:18px}
+  .cell .locked{color:var(--muted-2);opacity:.4;font-size:16px}
+  .cell.next{box-shadow:inset 0 0 0 2px var(--gold)}
   .cell.zero .v{color:var(--muted)}
   tr.sep td,tr.sep th{border-top:2px solid var(--line)}
   tr.sub td,tr.sub .rowlabel{background:var(--bg-1);color:var(--muted);font-size:12.5px}
@@ -456,6 +505,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border:1px solid var(--gold);border-radius:12px;padding:13px;font-weight:600}
   .donebar b{color:var(--gold);font-family:'Bricolage Grotesque',sans-serif}
   .foot{margin-top:auto;padding-top:16px;text-align:center;color:var(--muted-2);font-size:11.5px}
+  .foot .mode{display:block;margin-top:3px;color:var(--gold-deep)}
 
   /* modales */
   .overlay{position:fixed;inset:0;background:rgba(5,12,11,.66);display:flex;align-items:flex-end;justify-content:center;z-index:40;padding:0}
@@ -552,7 +602,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <span class="fld">Noms (modifiables)</span>
       <div class="names" id="names"></div>
-      <button class="btn primary" id="btnStart" style="margin-top:16px">Commencer</button>
+      <span class="fld" style="margin-top:16px">Options</span>
+      <div class="toggle-row" style="margin:0 0 12px">
+        <div class="t">Mini &amp; Maxi<small>2 cases somme des dés · l'écart (Maxi − Mini) s'ajoute au total</small></div>
+        <div class="sw" id="swMinimax"></div>
+      </div>
+      <span class="fld">Remplissage de la grille</span>
+      <div class="seg" id="segOrder">
+        <button data-o="free" class="on">Désordre<small>libre</small></button>
+        <button data-o="down">Ordre<small>haut → bas</small></button>
+        <button data-o="up">Ordre inversé<small>bas → haut</small></button>
+      </div>
+      <button class="btn primary" id="btnStart">Commencer</button>
     </div>
   </section>
 
@@ -581,7 +642,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="donebar hidden" id="doneBar"></div>
-    <div class="foot">Touche une case pour saisir · bonus +35 dès 63 en haut</div>
+    <div class="foot">Touche une case pour saisir · bonus +35 dès 63 en haut<span class="mode" id="footMode"></span></div>
   </section>
 
   <div class="foot" id="loading">Connexion à la partie…</div>
@@ -595,13 +656,19 @@ const socket = io({transports:["websocket","polling"]});
 let S=null, gid=null;
 let prevDice=[1,1,1,1,1], prevRolled=false;
 
-const CATS=[
+const BASE_UPPER=[
   {k:"un",label:"As",hint:"somme des 1"},
   {k:"deux",label:"Deux",hint:"somme des 2"},
   {k:"trois",label:"Trois",hint:"somme des 3"},
   {k:"quatre",label:"Quatre",hint:"somme des 4"},
   {k:"cinq",label:"Cinq",hint:"somme des 5"},
   {k:"six",label:"Six",hint:"somme des 6"},
+];
+const BASE_MID=[
+  {k:"maxi",label:"Maxi",hint:"somme des dés · viser haut"},
+  {k:"mini",label:"Mini",hint:"somme des dés · viser bas"},
+];
+const BASE_LOWER=[
   {k:"brelan",label:"Brelan",hint:"3 identiques · somme"},
   {k:"carre",label:"Carré",hint:"4 identiques · somme"},
   {k:"full",label:"Full",hint:"25 pts"},
@@ -610,6 +677,10 @@ const CATS=[
   {k:"yahtzee",label:"Yahtzee",hint:"50 pts"},
   {k:"chance",label:"Chance",hint:"somme des dés"},
 ];
+let CATS=BASE_UPPER.concat(BASE_LOWER);
+function buildCats(){CATS=S.minimax?BASE_UPPER.concat(BASE_MID,BASE_LOWER):BASE_UPPER.concat(BASE_LOWER);}
+function labelOf(k){const c=CATS.find(x=>x.k===k);return c?c.label:k;}
+
 const FIXED={full:25,petite_suite:30,grande_suite:40,yahtzee:50};
 const UPPER=["un","deux","trois","quatre","cinq","six"];
 const FACE={un:1,deux:2,trois:3,quatre:4,cinq:5,six:6};
@@ -620,12 +691,13 @@ const $=id=>document.getElementById(id);
 function show(sec){["setup","board"].forEach(s=>$(s).classList.toggle("hidden",s!==sec));$("loading").classList.add("hidden");}
 function toast(m){const t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),1700);}
 function readStored(){try{return JSON.parse(localStorage.getItem(LS)||"null");}catch(e){return null;}}
-function save(){if(gid){localStorage.setItem(LS,JSON.stringify({id:gid,snapshot:S?{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,current:S.current}:((readStored()||{}).snapshot||null)}));}}
+function save(){if(gid){localStorage.setItem(LS,JSON.stringify({id:gid,snapshot:S?{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,minimax:S.minimax,order_mode:S.order_mode,current:S.current}:((readStored()||{}).snapshot||null)}));}}
 
 function scoreFor(cat,dice){
   const c={};dice.forEach(d=>c[d]=(c[d]||0)+1);
   const counts=Object.values(c), sum=dice.reduce((a,b)=>a+b,0), mx=Math.max(...counts), ds=new Set(dice);
   if(FACE[cat])return (c[FACE[cat]]||0)*FACE[cat];
+  if(cat==="maxi"||cat==="mini")return sum;
   if(cat==="brelan")return mx>=3?sum:0;
   if(cat==="carre")return mx>=4?sum:0;
   if(cat==="full")return (counts.sort().join()==="2,3"||mx===5)?25:0;
@@ -673,6 +745,7 @@ document.addEventListener("visibilitychange",()=>{if(document.visibilityState===
 
 /* ---------- SETUP ---------- */
 let nPlayers=4;
+let optMinimax=false, optOrder="free";
 function openSetup(){show("setup");buildNames();renderResume();fetchGames();}
 
 function fetchGames(){if(socket.connected)socket.emit("list_games",{});}
@@ -720,16 +793,21 @@ function buildNames(){
 }
 $("minus").onclick=()=>{if(nPlayers>1){nPlayers--;$("np").textContent=nPlayers;buildNames();}};
 $("plus").onclick=()=>{if(nPlayers<10){nPlayers++;$("np").textContent=nPlayers;buildNames();}};
+$("swMinimax").onclick=()=>{optMinimax=!optMinimax;$("swMinimax").classList.toggle("on",optMinimax);};
+document.querySelectorAll("#segOrder button").forEach(b=>{
+  b.onclick=()=>{optOrder=b.dataset.o;document.querySelectorAll("#segOrder button").forEach(x=>x.classList.toggle("on",x===b));};
+});
 $("btnStart").onclick=()=>{
   const names=[...$("names").querySelectorAll("input")].map((inp,i)=>inp.value.trim()||("Joueur "+(i+1)));
   localStorage.removeItem(LS);
-  socket.emit("create_game",{names,dice_enabled:false});
+  socket.emit("create_game",{names,dice_enabled:false,minimax:optMinimax,order_mode:optOrder});
 };
 $("refreshGames").onclick=fetchGames;
 
 /* ---------- BOARD ---------- */
 function render(){
   if(!S)return;
+  buildCats();
   show("board");
 
   // dés
@@ -738,6 +816,9 @@ function render(){
   if(S.dice_enabled)renderDice();
 
   renderSheet();
+
+  const fm=$("footMode");
+  fm.textContent=S.order_mode==="down"?"Ordre imposé : haut → bas":S.order_mode==="up"?"Ordre imposé : bas → haut":"";
 
   if(S.complete&&S.leader>=0){
     $("doneBar").classList.remove("hidden");
@@ -792,9 +873,16 @@ function renderSheet(){
     S.players.forEach((p,i)=>{
       const td=document.createElement("td");td.className="cell"+(i===S.current?" cur":"");
       const v=p.scores[cat.k];
+      const locked=(S.order_mode!=="free")&&(v===null||v===undefined)&&(p.next!==cat.k);
       if(v!==null&&v!==undefined){td.innerHTML='<span class="v">'+v+'</span>';if(v===0)td.classList.add("zero");}
+      else if(locked){td.innerHTML='<span class="locked">·</span>';}
       else td.innerHTML='<span class="empty">+</span>';
-      td.classList.add("editable");td.onclick=()=>openCell(i,cat.k);
+      if((v===null||v===undefined)&&S.order_mode!=="free"&&p.next===cat.k)td.classList.add("next");
+      if(locked){
+        td.onclick=()=>toast("Ordre imposé — case suivante : "+labelOf(p.next));
+      }else{
+        td.classList.add("editable");td.onclick=()=>openCell(i,cat.k);
+      }
       row.appendChild(td);
     });
     tb.appendChild(row);
@@ -808,10 +896,16 @@ function renderSheet(){
     tb.appendChild(row);
   };
 
-  CATS.slice(0,6).forEach(c=>addCatRow(c));
+  const upperCats=CATS.filter(c=>UPPER.includes(c.k));
+  const midCats=CATS.filter(c=>c.k==="maxi"||c.k==="mini");
+  const lowCats=CATS.filter(c=>!UPPER.includes(c.k)&&c.k!=="maxi"&&c.k!=="mini");
+
+  upperCats.forEach(c=>addCatRow(c));
   addTotalRow("Total (haut)",p=>p.totals.upper,"sub");
   addBonusRow(tb);
-  CATS.slice(6).forEach((c,i)=>addCatRow(c,i===0?"sep":""));
+  midCats.forEach((c,i)=>addCatRow(c,i===0?"sep":""));
+  if(S.minimax)addEcartRow(tb);
+  lowCats.forEach((c,i)=>addCatRow(c,i===0?"sep":""));
   addTotalRow("TOTAL",p=>p.totals.total,"total sep");
   t.appendChild(tb);
 }
@@ -829,6 +923,21 @@ function addBonusRow(tb){
       const reste=Math.max(0,63-p.totals.upper);
       td.innerHTML='<span class="v">'+p.totals.upper+'/63</span><span class="bonus-mini" style="display:block">reste '+reste+'</span>';
     }
+    row.appendChild(td);
+  });
+  tb.appendChild(row);
+}
+
+function addEcartRow(tb){
+  const row=document.createElement("tr");row.className="sub";
+  const lab=document.createElement("td");lab.className="rowlabel";
+  lab.innerHTML='Écart <span class="bonus-mini">(Maxi − Mini)</span>';
+  row.appendChild(lab);
+  S.players.forEach(p=>{
+    const td=document.createElement("td");td.className="cell";
+    const mi=p.scores.mini, ma=p.scores.maxi;
+    const both=(mi!==null&&mi!==undefined&&ma!==null&&ma!==undefined);
+    td.innerHTML='<span class="v"'+(both&&ma<mi?' style="color:var(--red)"':'')+'>'+(both?Math.max(0,ma-mi):"—")+'</span>';
     row.appendChild(td);
   });
   tb.appendChild(row);
@@ -880,7 +989,7 @@ function openCellEditor(player,cat){
     return;
   }
 
-  // brelan, carré, chance : pavé numérique
+  // brelan, carré, chance, mini, maxi : pavé numérique
   cur.buf=filled?String(val):"";
   let html=head+'<div class="display'+(cur.buf?"":" empty")+'" id="disp">'+(cur.buf||"0")+'</div>';
   if(S.dice_enabled&&S.turn_rolled){const sug=scoreFor(cat,S.dice);html+='<div class="suggest"><button data-act="sug" data-v="'+sug+'">Score des dés : '+sug+'</button></div>';}
