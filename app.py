@@ -5,9 +5,14 @@ Concept : une personne (le créateur) tient la feuille de score sur son téléph
 Les autres ouvrent le même lien et regardent en LECTURE SEULE (pas de code).
 Saisie manuelle des scores (dés réels) ; dés virtuels en option.
 
-Options à la création :
- - Mini & Maxi : 2 cases (somme des dés) ; l'écart (Maxi − Mini) s'ajoute au total.
- - Ordre de remplissage : désordre (libre), ordre (haut → bas), ordre inversé (bas → haut).
+Variantes (choisies à la création de la partie) :
+  - Colonnes : chaque joueur joue 1 à 3 grilles en parallèle parmi
+    désordre (libre), ordre descendant (haut -> bas) et ordre inversé
+    (bas -> haut). À chaque tour, on remplit UNE case dans la colonne de
+    son choix. Dans une colonne ordonnée, seule la prochaine case imposée
+    est acceptée. Le total du joueur = somme de ses colonnes.
+  - Mini & Maxi : deux cases "somme des dés" dans chaque colonne ;
+    l'écart (Maxi - Mini) s'ajoute au total de la colonne (0 si Maxi <= Mini).
 
 Lancer :  python app.py   ->  http://localhost:5000
 Prod   :  gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 --bind 0.0.0.0:$PORT app:app
@@ -32,14 +37,27 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 UPPER = {"un": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "six": 6}
 UPPER_CATS = ["un", "deux", "trois", "quatre", "cinq", "six"]
-MID_CATS = ["maxi", "mini"]  # optionnel (option Mini & Maxi)
+MINIMAX_CATS = ["maxi", "mini"]
 LOWER_CATS = ["brelan", "carre", "full", "petite_suite", "grande_suite", "yahtzee", "chance"]
+CATEGORIES = UPPER_CATS + MINIMAX_CATS + LOWER_CATS  # superset de toutes les cases possibles
 FIXED = {"full": 25, "petite_suite": 30, "grande_suite": 40, "yahtzee": 50}
-ORDER_MODES = ("free", "down", "up")
+MODES = ("libre", "ordre", "ordre_inverse")  # ordre canonique des colonnes
 
 
-def game_categories(minimax):
-    return UPPER_CATS + (MID_CATS if minimax else []) + LOWER_CATS
+def clean_columns(cols):
+    """Filtre/déduplique la liste de colonnes demandée, ordre canonique."""
+    if not isinstance(cols, list):
+        cols = None
+    out = [m for m in MODES if cols and m in cols]
+    return out or ["libre"]
+
+
+def game_cats(g):
+    """Cases actives pour une partie. L'ordre de la liste sert d'ordre imposé."""
+    cats = UPPER_CATS[:]
+    if g.get("minimax"):
+        cats += MINIMAX_CATS
+    return cats + LOWER_CATS
 
 
 def score_for(category, dice):
@@ -49,8 +67,6 @@ def score_for(category, dice):
     counts = c.values()
     if category in UPPER:
         return c[UPPER[category]] * UPPER[category]
-    if category in ("maxi", "mini"):
-        return total
     if category == "brelan":
         return total if max(counts) >= 3 else 0
     if category == "carre":
@@ -65,35 +81,33 @@ def score_for(category, dice):
         return 40 if ds in ({1, 2, 3, 4, 5}, {2, 3, 4, 5, 6}) else 0
     if category == "yahtzee":
         return 50 if max(counts) == 5 else 0
+    if category in ("maxi", "mini"):
+        return total
     if category == "chance":
         return total
     return 0
 
 
 def totals(g, player):
-    s = player["scores"]
-    upper = sum(s[c] or 0 for c in UPPER_CATS)
-    bonus = 35 if upper >= 63 else 0
-    lower = sum(s[c] or 0 for c in LOWER_CATS)
-    ecart = 0
-    if g["minimax"]:
-        mi, ma = s.get("mini"), s.get("maxi")
-        if mi is not None and ma is not None:
-            ecart = max(0, ma - mi)  # 0 si Maxi < Mini
-    return {"upper": upper, "bonus": bonus, "lower": lower, "ecart": ecart,
-            "total": upper + bonus + lower + ecart,
-            "complete": all(s[c] is not None for c in g["categories"])}
-
-
-def next_required(g, idx):
-    """Prochaine case imposée pour un joueur (None si mode libre ou feuille finie)."""
-    if g["order_mode"] == "free":
-        return None
-    cats = g["categories"] if g["order_mode"] == "down" else list(reversed(g["categories"]))
-    for c in cats:
-        if g["players"][idx]["scores"][c] is None:
-            return c
-    return None
+    """Totaux par colonne + total général du joueur."""
+    cats = game_cats(g)
+    cols = []
+    grand = 0
+    complete = True
+    for sc in player["scores"]:
+        upper = sum(sc[c] or 0 for c in UPPER_CATS)
+        bonus = 35 if upper >= 63 else 0
+        lower = sum(sc[c] or 0 for c in LOWER_CATS)
+        ecart = 0
+        if g.get("minimax"):
+            ma, mi = sc.get("maxi"), sc.get("mini")
+            if ma is not None and mi is not None and ma > mi:
+                ecart = ma - mi
+        tot = upper + bonus + lower + ecart
+        grand += tot
+        complete = complete and all(sc[c] is not None for c in cats)
+        cols.append({"upper": upper, "bonus": bonus, "lower": lower, "ecart": ecart, "total": tot})
+    return {"cols": cols, "total": grand, "complete": complete}
 
 
 # ---------------------------------------------------------------------------
@@ -115,31 +129,41 @@ def new_token():
     return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(24))
 
 
-def make_player(name, cats):
-    return {"name": name, "scores": {c: None for c in cats}}
+def make_player(name, ncols, cats):
+    return {"name": name, "scores": [{c: None for c in cats} for _ in range(ncols)]}
 
 
-def make_game(gid, names, dice_enabled, minimax=False, order_mode="free"):
-    if order_mode not in ORDER_MODES:
-        order_mode = "free"
-    cats = game_categories(bool(minimax))
-    return {
+def make_game(gid, names, dice_enabled, columns=None, minimax=False):
+    g = {
         "id": gid,
-        "players": [make_player(n, cats) for n in names],
-        "minimax": bool(minimax),
-        "order_mode": order_mode,
-        "categories": cats,
+        "players": [],
         "dice_enabled": bool(dice_enabled),
+        "columns": clean_columns(columns),
+        "minimax": bool(minimax),
         "dice": [1, 1, 1, 1, 1], "held": [False] * 5,
         "rolls_left": 3, "turn_rolled": False,
         "current": 0,
         "updated": time.time(),
     }
+    cats = game_cats(g)
+    g["players"] = [make_player(n, len(g["columns"]), cats) for n in names]
+    return g
+
+
+def next_required(g, player, col):
+    """Prochaine case imposée dans une colonne ordonnée (None si colonne libre)."""
+    mode = g["columns"][col]
+    if mode == "libre":
+        return None
+    cats = game_cats(g)
+    if mode == "ordre_inverse":
+        cats = cats[::-1]
+    sc = player["scores"][col]
+    return next((c for c in cats if sc[c] is None), None)
 
 
 def serialize(g):
-    ps = [{"name": p["name"], "scores": p["scores"], "totals": totals(g, p),
-           "next": next_required(g, i)} for i, p in enumerate(g["players"])]
+    ps = [{"name": p["name"], "scores": p["scores"], "totals": totals(g, p)} for p in g["players"]]
     complete = bool(ps) and all(p["totals"]["complete"] for p in ps)
     leader = -1
     best = -1
@@ -151,8 +175,8 @@ def serialize(g):
         leader = -1
     return {
         "id": g["id"], "players": ps,
-        "minimax": g["minimax"], "order_mode": g["order_mode"],
         "dice_enabled": g["dice_enabled"],
+        "columns": g["columns"], "minimax": g["minimax"],
         "dice": g["dice"], "held": g["held"],
         "rolls_left": g["rolls_left"], "turn_rolled": g["turn_rolled"],
         "complete": complete, "leader": leader, "current": g["current"],
@@ -196,7 +220,7 @@ def on_create(data):
     names = [(n or f"Joueur {i+1}").strip()[:18] or f"Joueur {i+1}" for i, n in enumerate(names)][:10]
     gid = new_id()
     games[gid] = make_game(gid, names, data.get("dice_enabled"),
-                           data.get("minimax"), data.get("order_mode") or "free")
+                           data.get("columns"), data.get("minimax"))
     join_room(gid)
     emit("created", {"id": gid})
     broadcast(gid)
@@ -216,13 +240,21 @@ def on_open(data):
         if not names:
             emit("expired", {})
             return
-        g = make_game(gid, names, snap.get("dice_enabled"),
-                      snap.get("minimax"), snap.get("order_mode") or "free")
+        cols = snap.get("columns")
+        if cols is None and snap.get("mode"):  # anciens snapshots (une seule colonne)
+            cols = [snap["mode"]]
+        g = make_game(gid, names, snap.get("dice_enabled"), cols, snap.get("minimax"))
         for i, p in enumerate(snap.get("players", [])):
-            sc = p.get("scores", {})
-            for c in g["categories"]:
-                v = sc.get(c)
-                g["players"][i]["scores"][c] = v if isinstance(v, int) else None
+            sc = p.get("scores")
+            if isinstance(sc, list):  # nouveau format : une grille par colonne
+                for j in range(min(len(sc), len(g["columns"]))):
+                    for c in game_cats(g):
+                        v = (sc[j] or {}).get(c)
+                        g["players"][i]["scores"][j][c] = v if isinstance(v, int) else None
+            elif isinstance(sc, dict):  # ancien format à plat -> colonne 0
+                for c in game_cats(g):
+                    v = sc.get(c)
+                    g["players"][i]["scores"][0][c] = v if isinstance(v, int) else None
         cu = snap.get("current", 0)
         g["current"] = cu if isinstance(cu, int) and 0 <= cu < len(g["players"]) else 0
         games[gid] = g
@@ -234,12 +266,14 @@ def on_open(data):
 def on_list(data=None):
     items = []
     for gid, g in games.items():
-        filled = sum(1 for p in g["players"] for c in g["categories"] if p["scores"][c] is not None)
+        cats = game_cats(g)
+        filled = sum(1 for p in g["players"] for sc in p["scores"]
+                     for c in cats if sc[c] is not None)
         items.append({
             "id": gid,
             "players": [p["name"] for p in g["players"]],
             "filled": filled,
-            "total": len(g["players"]) * len(g["categories"]),
+            "total": len(g["players"]) * len(g["columns"]) * len(cats),
             "updated": g.get("updated", 0),
         })
     items.sort(key=lambda x: x["updated"], reverse=True)
@@ -252,18 +286,25 @@ def on_set_score(data):
     if not ok:
         return
     i = data.get("player")
+    col = data.get("col", 0)
     cat = data.get("category")
     val = data.get("value")
-    if not isinstance(i, int) or i < 0 or i >= len(g["players"]) or cat not in g["categories"]:
+    cats = game_cats(g)
+    if not isinstance(i, int) or i < 0 or i >= len(g["players"]) or cat not in cats:
         return
+    if not isinstance(col, int) or col < 0 or col >= len(g["columns"]):
+        return
+    p = g["players"][i]
+    sc = p["scores"][col]
     if val is None:
-        g["players"][i]["scores"][cat] = None
+        sc[cat] = None
     elif isinstance(val, (int, float)):
-        was = g["players"][i]["scores"][cat]
-        # ordre imposé : une case vide ne peut être remplie que si c'est la suivante
-        if was is None and g["order_mode"] != "free" and cat != next_required(g, i):
+        was = sc[cat]
+        # colonne ordonnée : une case vide ne peut être remplie que si c'est la prochaine imposée
+        if was is None and g["columns"][col] != "libre" and cat != next_required(g, p, col):
             return
-        g["players"][i]["scores"][cat] = max(0, min(999, int(val)))
+        hi = 30 if cat in MINIMAX_CATS else 999
+        sc[cat] = max(0, min(hi, int(val)))
         # quand le joueur en cours remplit une case vide -> au suivant
         if was is None and i == g["current"]:
             g["current"] = (g["current"] + 1) % len(g["players"])
@@ -298,7 +339,8 @@ def on_add_player(data):
     g, ok = auth(data)
     if not ok or len(g["players"]) >= 10:
         return
-    g["players"].append(make_player(f"Joueur {len(g['players'])+1}", g["categories"]))
+    g["players"].append(make_player(f"Joueur {len(g['players'])+1}",
+                                    len(g["columns"]), game_cats(g)))
     broadcast(g["id"])
 
 
@@ -427,12 +469,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .sw::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:var(--ivory);transition:left .15s}
   .sw.on::after{left:25px}
 
-  .seg{display:flex;gap:8px;margin-bottom:16px}
-  .seg button{flex:1;padding:10px 4px;border-radius:11px;background:var(--bg-0);border:1px solid var(--line);
-    color:var(--muted);font-size:13.5px;font-weight:600;line-height:1.2}
-  .seg button small{display:block;font-size:10.5px;font-weight:400;margin-top:3px;color:var(--muted-2)}
-  .seg button.on{background:rgba(240,181,61,.13);border-color:var(--gold);color:var(--gold)}
-  .seg button.on small{color:var(--gold-deep)}
+  /* variantes (setup) : colonnes multi-sélection */
+  .seg{display:flex;background:var(--bg-0);border:1px solid var(--line);border-radius:12px;padding:4px;gap:4px}
+  .seg button{flex:1;padding:11px 4px;border-radius:9px;background:transparent;color:var(--muted);font-size:13.5px;font-weight:600;position:relative}
+  .seg button.on{background:var(--gold);color:#2a1d04}
+  .seg-hint{font-size:12px;color:var(--muted-2);margin:7px 2px 0;min-height:16px;line-height:1.4}
 
   .btn{width:100%;padding:15px;border-radius:12px;font-weight:600;background:var(--panel-2);color:var(--ivory);border:1px solid var(--line);transition:transform .08s}
   .btn:active{transform:scale(.985)}
@@ -482,7 +523,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   thead .rowlabel{background:var(--panel-2);z-index:4}
   .rowlabel .hint{display:block;font-size:10.5px;color:var(--muted-2);font-weight:400;margin-top:1px}
   .phead{padding:9px 6px !important;min-width:66px}
-  .phead .nm{display:block;max-width:80px;overflow:hidden;text-overflow:ellipsis;margin:0 auto;font-weight:600;font-size:13px}
+  .phead .nm{display:block;max-width:110px;overflow:hidden;text-overflow:ellipsis;margin:0 auto;font-weight:600;font-size:13px}
   .phead.lead .nm{color:var(--gold)}
   .phead .crown{display:block;font-size:11px;color:var(--gold);height:13px;line-height:1}
   .cell{height:46px;font-variant-numeric:tabular-nums;font-size:16px}
@@ -490,8 +531,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .cell.editable:active{background:rgba(240,181,61,.12)}
   .cell .v{font-weight:600}
   .cell .empty{color:var(--muted-2);font-size:18px}
-  .cell .locked{color:var(--muted-2);opacity:.4;font-size:16px}
-  .cell.next{box-shadow:inset 0 0 0 2px var(--gold)}
+  .cell.next .empty{color:var(--gold);font-weight:600}
+  .cell .lockdot{color:var(--muted-2);opacity:.45;font-size:18px}
   .cell.zero .v{color:var(--muted)}
   tr.sep td,tr.sep th{border-top:2px solid var(--line)}
   tr.sub td,tr.sub .rowlabel{background:var(--bg-1);color:var(--muted);font-size:12.5px}
@@ -501,11 +542,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
   tr.total .rowlabel{font-size:15px}
   .bonus-mini{font-size:10px;color:var(--muted-2);font-weight:400}
 
+  /* mode multi-colonnes */
+  .psep{border-left:2px solid var(--line)}
+  .colhead{font-size:10px;color:var(--muted);font-weight:600;padding:4px 3px !important;
+    min-width:48px;text-transform:uppercase;letter-spacing:.03em}
+  table.sheet.multi thead tr:first-child th{height:47px}
+  table.sheet.multi thead tr:nth-child(2) th{top:47px}
+  table.sheet.multi .cell{min-width:48px;font-size:14px;height:42px}
+  table.sheet.multi tr.total .cell{font-size:17px}
+  table.sheet.multi .phead{min-width:0}
+
   .donebar{margin-top:12px;text-align:center;background:linear-gradient(180deg,rgba(240,181,61,.16),rgba(240,181,61,.04));
     border:1px solid var(--gold);border-radius:12px;padding:13px;font-weight:600}
   .donebar b{color:var(--gold);font-family:'Bricolage Grotesque',sans-serif}
   .foot{margin-top:auto;padding-top:16px;text-align:center;color:var(--muted-2);font-size:11.5px}
-  .foot .mode{display:block;margin-top:3px;color:var(--gold-deep)}
 
   /* modales */
   .overlay{position:fixed;inset:0;background:rgba(5,12,11,.66);display:flex;align-items:flex-end;justify-content:center;z-index:40;padding:0}
@@ -602,18 +652,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <span class="fld">Noms (modifiables)</span>
       <div class="names" id="names"></div>
-      <span class="fld" style="margin-top:16px">Options</span>
-      <div class="toggle-row" style="margin:0 0 12px">
-        <div class="t">Mini &amp; Maxi<small>2 cases somme des dés · l'écart (Maxi − Mini) s'ajoute au total</small></div>
-        <div class="sw" id="swMinimax"></div>
+      <span class="fld" style="margin-top:16px">Colonnes de la grille (cumulables)</span>
+      <div class="seg" id="colSeg">
+        <button type="button" data-mode="libre" class="on">Désordre</button>
+        <button type="button" data-mode="ordre">Ordre ↓</button>
+        <button type="button" data-mode="ordre_inverse">Ordre ↑</button>
       </div>
-      <span class="fld">Remplissage de la grille</span>
-      <div class="seg" id="segOrder">
-        <button data-o="free" class="on">Désordre<small>libre</small></button>
-        <button data-o="down">Ordre<small>haut → bas</small></button>
-        <button data-o="up">Ordre inversé<small>bas → haut</small></button>
+      <div class="seg-hint" id="colHint"></div>
+      <div class="toggle-row" style="margin:14px 0 0">
+        <div class="t">Mini &amp; Maxi<small>Deux cases « somme des dés » — l'écart (Maxi − Mini) s'ajoute au total</small></div>
+        <div class="sw" id="mmSw"></div>
       </div>
-      <button class="btn primary" id="btnStart">Commencer</button>
+      <button class="btn primary" id="btnStart" style="margin-top:16px">Commencer</button>
     </div>
   </section>
 
@@ -642,7 +692,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="donebar hidden" id="doneBar"></div>
-    <div class="foot">Touche une case pour saisir · bonus +35 dès 63 en haut<span class="mode" id="footMode"></span></div>
+    <div class="foot" id="sheetFoot">Touche une case pour saisir · bonus +35 dès 63 en haut</div>
   </section>
 
   <div class="foot" id="loading">Connexion à la partie…</div>
@@ -656,7 +706,7 @@ const socket = io({transports:["websocket","polling"]});
 let S=null, gid=null;
 let prevDice=[1,1,1,1,1], prevRolled=false;
 
-const BASE_UPPER=[
+const CATS_UPPER=[
   {k:"un",label:"As",hint:"somme des 1"},
   {k:"deux",label:"Deux",hint:"somme des 2"},
   {k:"trois",label:"Trois",hint:"somme des 3"},
@@ -664,11 +714,11 @@ const BASE_UPPER=[
   {k:"cinq",label:"Cinq",hint:"somme des 5"},
   {k:"six",label:"Six",hint:"somme des 6"},
 ];
-const BASE_MID=[
+const CATS_MM=[
   {k:"maxi",label:"Maxi",hint:"somme des dés · viser haut"},
   {k:"mini",label:"Mini",hint:"somme des dés · viser bas"},
 ];
-const BASE_LOWER=[
+const CATS_LOWER=[
   {k:"brelan",label:"Brelan",hint:"3 identiques · somme"},
   {k:"carre",label:"Carré",hint:"4 identiques · somme"},
   {k:"full",label:"Full",hint:"25 pts"},
@@ -677,10 +727,11 @@ const BASE_LOWER=[
   {k:"yahtzee",label:"Yahtzee",hint:"50 pts"},
   {k:"chance",label:"Chance",hint:"somme des dés"},
 ];
-let CATS=BASE_UPPER.concat(BASE_LOWER);
-function buildCats(){CATS=S.minimax?BASE_UPPER.concat(BASE_MID,BASE_LOWER):BASE_UPPER.concat(BASE_LOWER);}
-function labelOf(k){const c=CATS.find(x=>x.k===k);return c?c.label:k;}
-
+function gameCats(){let c=CATS_UPPER.slice();if(S&&S.minimax)c=c.concat(CATS_MM);return c.concat(CATS_LOWER);}
+function labelOf(k){const c=gameCats().find(x=>x.k===k);return c?c.label:k;}
+const COL_LABELS={libre:"Libre",ordre:"Ordre ↓",ordre_inverse:"Ordre ↑"};
+const COL_NAMES={libre:"désordre",ordre:"ordre ↓",ordre_inverse:"ordre ↑"};
+const MODES_ORDER=["libre","ordre","ordre_inverse"];
 const FIXED={full:25,petite_suite:30,grande_suite:40,yahtzee:50};
 const UPPER=["un","deux","trois","quatre","cinq","six"];
 const FACE={un:1,deux:2,trois:3,quatre:4,cinq:5,six:6};
@@ -691,21 +742,31 @@ const $=id=>document.getElementById(id);
 function show(sec){["setup","board"].forEach(s=>$(s).classList.toggle("hidden",s!==sec));$("loading").classList.add("hidden");}
 function toast(m){const t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),1700);}
 function readStored(){try{return JSON.parse(localStorage.getItem(LS)||"null");}catch(e){return null;}}
-function save(){if(gid){localStorage.setItem(LS,JSON.stringify({id:gid,snapshot:S?{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,minimax:S.minimax,order_mode:S.order_mode,current:S.current}:((readStored()||{}).snapshot||null)}));}}
+function save(){if(gid){localStorage.setItem(LS,JSON.stringify({id:gid,snapshot:S?{players:S.players.map(p=>({name:p.name,scores:p.scores})),dice_enabled:S.dice_enabled,current:S.current,columns:S.columns,minimax:S.minimax}:((readStored()||{}).snapshot||null)}));}}
 
 function scoreFor(cat,dice){
   const c={};dice.forEach(d=>c[d]=(c[d]||0)+1);
   const counts=Object.values(c), sum=dice.reduce((a,b)=>a+b,0), mx=Math.max(...counts), ds=new Set(dice);
   if(FACE[cat])return (c[FACE[cat]]||0)*FACE[cat];
-  if(cat==="maxi"||cat==="mini")return sum;
   if(cat==="brelan")return mx>=3?sum:0;
   if(cat==="carre")return mx>=4?sum:0;
   if(cat==="full")return (counts.sort().join()==="2,3"||mx===5)?25:0;
   if(cat==="petite_suite")return [[1,2,3,4],[2,3,4,5],[3,4,5,6]].some(s=>s.every(x=>ds.has(x)))?30:0;
   if(cat==="grande_suite")return ([1,2,3,4,5].every(x=>ds.has(x))||[2,3,4,5,6].every(x=>ds.has(x)))?40:0;
   if(cat==="yahtzee")return mx===5?50:0;
+  if(cat==="maxi"||cat==="mini")return sum;
   if(cat==="chance")return sum;
   return 0;
+}
+
+/* colonne ordonnée : prochaine case imposée pour un joueur (null si colonne libre) */
+function nextCatFor(p,col){
+  if(!S)return null;
+  const mode=S.columns[col];
+  if(mode==="libre")return null;
+  let ks=gameCats().map(c=>c.k);
+  if(mode==="ordre_inverse")ks=ks.slice().reverse();
+  return ks.find(k=>p.scores[col][k]==null)||null;
 }
 
 /* ---------- identité / connexion ----------
@@ -745,8 +806,22 @@ document.addEventListener("visibilitychange",()=>{if(document.visibilityState===
 
 /* ---------- SETUP ---------- */
 let nPlayers=4;
-let optMinimax=false, optOrder="free";
-function openSetup(){show("setup");buildNames();renderResume();fetchGames();}
+let selCols=["libre"], selMM=false;
+function colHintTxt(){
+  if(selCols.length===1){
+    return {
+      libre:"1 colonne — chacun remplit ses cases dans l'ordre qu'il veut.",
+      ordre:"1 colonne — à remplir de haut en bas (As → Chance).",
+      ordre_inverse:"1 colonne — à remplir de bas en haut (Chance → As)."
+    }[selCols[0]];
+  }
+  return selCols.length+" colonnes ("+selCols.map(m=>COL_NAMES[m]).join(" + ")+") — à chaque tour, on inscrit son score dans une seule case, dans la colonne de son choix.";
+}
+function refreshColSeg(){
+  document.querySelectorAll("#colSeg button").forEach(b=>b.classList.toggle("on",selCols.includes(b.dataset.mode)));
+  $("colHint").textContent=colHintTxt();
+}
+function openSetup(){show("setup");buildNames();renderResume();fetchGames();refreshColSeg();}
 
 function fetchGames(){if(socket.connected)socket.emit("list_games",{});}
 socket.on("games_list",d=>renderGames(d.games||[]));
@@ -793,21 +868,29 @@ function buildNames(){
 }
 $("minus").onclick=()=>{if(nPlayers>1){nPlayers--;$("np").textContent=nPlayers;buildNames();}};
 $("plus").onclick=()=>{if(nPlayers<10){nPlayers++;$("np").textContent=nPlayers;buildNames();}};
-$("swMinimax").onclick=()=>{optMinimax=!optMinimax;$("swMinimax").classList.toggle("on",optMinimax);};
-document.querySelectorAll("#segOrder button").forEach(b=>{
-  b.onclick=()=>{optOrder=b.dataset.o;document.querySelectorAll("#segOrder button").forEach(x=>x.classList.toggle("on",x===b));};
+document.querySelectorAll("#colSeg button").forEach(b=>{
+  b.onclick=()=>{
+    const m=b.dataset.mode;
+    if(selCols.includes(m)){
+      if(selCols.length===1){toast("Il faut au moins une colonne");return;}
+      selCols=selCols.filter(x=>x!==m);
+    }else{
+      selCols=MODES_ORDER.filter(x=>selCols.includes(x)||x===m);
+    }
+    refreshColSeg();
+  };
 });
+$("mmSw").onclick=()=>{selMM=!selMM;$("mmSw").classList.toggle("on",selMM);};
 $("btnStart").onclick=()=>{
   const names=[...$("names").querySelectorAll("input")].map((inp,i)=>inp.value.trim()||("Joueur "+(i+1)));
   localStorage.removeItem(LS);
-  socket.emit("create_game",{names,dice_enabled:false,minimax:optMinimax,order_mode:optOrder});
+  socket.emit("create_game",{names,dice_enabled:false,columns:selCols,minimax:selMM});
 };
 $("refreshGames").onclick=fetchGames;
 
 /* ---------- BOARD ---------- */
 function render(){
   if(!S)return;
-  buildCats();
   show("board");
 
   // dés
@@ -817,8 +900,12 @@ function render(){
 
   renderSheet();
 
-  const fm=$("footMode");
-  fm.textContent=S.order_mode==="down"?"Ordre imposé : haut → bas":S.order_mode==="up"?"Ordre imposé : bas → haut":"";
+  const nCols=S.columns.length;
+  let foot="Touche une case pour saisir · bonus +35 dès 63 en haut";
+  if(nCols>1)foot+=" · "+nCols+" colonnes par joueur";
+  else if(S.columns[0]==="ordre")foot+=" · ordre ↓ imposé";
+  else if(S.columns[0]==="ordre_inverse")foot+=" · ordre ↑ imposé";
+  $("sheetFoot").textContent=foot;
 
   if(S.complete&&S.leader>=0){
     $("doneBar").classList.remove("hidden");
@@ -852,17 +939,36 @@ function renderDice(){
 
 function renderSheet(){
   const t=$("sheet");t.innerHTML="";
+  const nCols=S.columns.length, multi=nCols>1;
+  t.className="sheet"+(multi?" multi":"");
+
   const thead=document.createElement("thead");
-  let tr=document.createElement("tr");
-  tr.innerHTML='<th class="rowlabel">Catégorie</th>';
+  const tr1=document.createElement("tr");
+  const corner=document.createElement("th");corner.className="rowlabel";corner.textContent="Catégorie";
+  if(multi)corner.rowSpan=2;
+  tr1.appendChild(corner);
   S.players.forEach((p,i)=>{
     const th=document.createElement("th");
-    th.className="phead"+(i===S.leader?" lead":"")+(i===S.current?" cur":"");
+    th.className="phead"+(i===S.leader?" lead":"")+(i===S.current?" cur":"")+(multi&&i>0?" psep":"");
+    th.colSpan=nCols;
     th.innerHTML='<span class="nm">'+(i===S.leader?"♛ ":"")+escapeHtml(p.name)+'</span><span class="turntag">'+(i===S.current?"à jouer":"")+'</span>';
     th.onclick=()=>openRename(i);
-    tr.appendChild(th);
+    tr1.appendChild(th);
   });
-  thead.appendChild(tr);t.appendChild(thead);
+  thead.appendChild(tr1);
+  if(multi){
+    const tr2=document.createElement("tr");
+    S.players.forEach((p,i)=>{
+      S.columns.forEach((m,j)=>{
+        const th=document.createElement("th");
+        th.className="colhead"+((j===0&&i>0)?" psep":"");
+        th.textContent=COL_LABELS[m];
+        tr2.appendChild(th);
+      });
+    });
+    thead.appendChild(tr2);
+  }
+  t.appendChild(thead);
 
   const tb=document.createElement("tbody");
   const addCatRow=(cat,cls)=>{
@@ -871,95 +977,119 @@ function renderSheet(){
     lab.innerHTML=cat.label+'<span class="hint">'+cat.hint+'</span>';
     row.appendChild(lab);
     S.players.forEach((p,i)=>{
-      const td=document.createElement("td");td.className="cell"+(i===S.current?" cur":"");
-      const v=p.scores[cat.k];
-      const locked=(S.order_mode!=="free")&&(v===null||v===undefined)&&(p.next!==cat.k);
-      if(v!==null&&v!==undefined){td.innerHTML='<span class="v">'+v+'</span>';if(v===0)td.classList.add("zero");}
-      else if(locked){td.innerHTML='<span class="locked">·</span>';}
-      else td.innerHTML='<span class="empty">+</span>';
-      if((v===null||v===undefined)&&S.order_mode!=="free"&&p.next===cat.k)td.classList.add("next");
-      if(locked){
-        td.onclick=()=>toast("Ordre imposé — case suivante : "+labelOf(p.next));
-      }else{
-        td.classList.add("editable");td.onclick=()=>openCell(i,cat.k);
-      }
-      row.appendChild(td);
+      S.columns.forEach((m,j)=>{
+        const td=document.createElement("td");
+        td.className="cell"+(i===S.current?" cur":"")+((multi&&j===0&&i>0)?" psep":"");
+        const v=p.scores[j][cat.k];
+        if(v!==null&&v!==undefined){
+          td.innerHTML='<span class="v">'+v+'</span>';if(v===0)td.classList.add("zero");
+          td.classList.add("editable");td.onclick=()=>openCell(i,j,cat.k);
+        }else{
+          const nxt=nextCatFor(p,j);
+          if(nxt&&nxt!==cat.k){
+            // colonne ordonnée : case verrouillée tant que ce n'est pas son tour dans la grille
+            td.innerHTML='<span class="lockdot">·</span>';
+            td.onclick=()=>toast("Colonne "+COL_LABELS[m]+" — case suivante : "+labelOf(nxt));
+          }else{
+            if(nxt)td.classList.add("next");
+            td.innerHTML='<span class="empty">+</span>';
+            td.classList.add("editable");td.onclick=()=>openCell(i,j,cat.k);
+          }
+        }
+        row.appendChild(td);
+      });
     });
     tb.appendChild(row);
   };
-  const addTotalRow=(label,fn,cls,bonus)=>{
+  const addTotalRow=(label,fn,cls)=>{
     const row=document.createElement("tr");row.className=cls;
     const lab=document.createElement("td");lab.className="rowlabel";
-    lab.innerHTML=label+(bonus?' <span class="bonus-mini">(+35 dès 63)</span>':"");
+    lab.innerHTML=label;
     row.appendChild(lab);
-    S.players.forEach(p=>{const td=document.createElement("td");td.className="cell";td.innerHTML='<span class="v">'+fn(p)+'</span>';row.appendChild(td);});
+    S.players.forEach((p,i)=>{
+      S.columns.forEach((m,j)=>{
+        const td=document.createElement("td");
+        td.className="cell"+((multi&&j===0&&i>0)?" psep":"");
+        td.innerHTML='<span class="v">'+fn(p,j)+'</span>';
+        row.appendChild(td);
+      });
+    });
     tb.appendChild(row);
   };
 
-  const upperCats=CATS.filter(c=>UPPER.includes(c.k));
-  const midCats=CATS.filter(c=>c.k==="maxi"||c.k==="mini");
-  const lowCats=CATS.filter(c=>!UPPER.includes(c.k)&&c.k!=="maxi"&&c.k!=="mini");
-
-  upperCats.forEach(c=>addCatRow(c));
-  addTotalRow("Total (haut)",p=>p.totals.upper,"sub");
-  addBonusRow(tb);
-  midCats.forEach((c,i)=>addCatRow(c,i===0?"sep":""));
-  if(S.minimax)addEcartRow(tb);
-  lowCats.forEach((c,i)=>addCatRow(c,i===0?"sep":""));
-  addTotalRow("TOTAL",p=>p.totals.total,"total sep");
+  CATS_UPPER.forEach(c=>addCatRow(c));
+  addTotalRow("Total (haut)",(p,j)=>p.totals.cols[j].upper,"sub");
+  addBonusRow(tb,multi);
+  if(S.minimax){
+    addCatRow(CATS_MM[0],"sep");
+    addCatRow(CATS_MM[1]);
+    addTotalRow("Écart Maxi − Mini",(p,j)=>{
+      const ma=p.scores[j].maxi,mi=p.scores[j].mini;
+      return (ma!==null&&ma!==undefined&&mi!==null&&mi!==undefined)?p.totals.cols[j].ecart:"—";
+    },"sub");
+  }
+  CATS_LOWER.forEach((c,i)=>addCatRow(c,i===0?"sep":""));
+  if(multi){
+    addTotalRow("Total colonne",(p,j)=>p.totals.cols[j].total,"sub sep");
+    const row=document.createElement("tr");row.className="total";
+    const lab=document.createElement("td");lab.className="rowlabel";lab.textContent="TOTAL";
+    row.appendChild(lab);
+    S.players.forEach((p,i)=>{
+      const td=document.createElement("td");
+      td.className="cell"+(i>0?" psep":"");td.colSpan=nCols;
+      td.innerHTML='<span class="v">'+p.totals.total+'</span>';
+      row.appendChild(td);
+    });
+    tb.appendChild(row);
+  }else{
+    addTotalRow("TOTAL",(p,j)=>p.totals.total,"total sep");
+  }
   t.appendChild(tb);
 }
 
-function addBonusRow(tb){
+function addBonusRow(tb,multi){
   const row=document.createElement("tr");row.className="sub bonusrow";
   const lab=document.createElement("td");lab.className="rowlabel";
   lab.innerHTML='Bonus <span class="bonus-mini">(+35 dès 63)</span>';
   row.appendChild(lab);
   S.players.forEach((p,i)=>{
-    const td=document.createElement("td");td.className="cell"+(i===S.current?" cur":"");
-    if(p.totals.bonus>0){
-      td.innerHTML='<span class="v" style="color:var(--mint)">+35 ✓</span>';
-    }else{
-      const reste=Math.max(0,63-p.totals.upper);
-      td.innerHTML='<span class="v">'+p.totals.upper+'/63</span><span class="bonus-mini" style="display:block">reste '+reste+'</span>';
-    }
-    row.appendChild(td);
-  });
-  tb.appendChild(row);
-}
-
-function addEcartRow(tb){
-  const row=document.createElement("tr");row.className="sub";
-  const lab=document.createElement("td");lab.className="rowlabel";
-  lab.innerHTML='Écart <span class="bonus-mini">(Maxi − Mini)</span>';
-  row.appendChild(lab);
-  S.players.forEach(p=>{
-    const td=document.createElement("td");td.className="cell";
-    const mi=p.scores.mini, ma=p.scores.maxi;
-    const both=(mi!==null&&mi!==undefined&&ma!==null&&ma!==undefined);
-    td.innerHTML='<span class="v"'+(both&&ma<mi?' style="color:var(--red)"':'')+'>'+(both?Math.max(0,ma-mi):"—")+'</span>';
-    row.appendChild(td);
+    S.columns.forEach((m,j)=>{
+      const td=document.createElement("td");
+      td.className="cell"+(i===S.current?" cur":"")+((multi&&j===0&&i>0)?" psep":"");
+      const ct=p.totals.cols[j];
+      if(ct.bonus>0){
+        td.innerHTML='<span class="v" style="color:var(--mint)">+35 ✓</span>';
+      }else if(multi){
+        td.innerHTML='<span class="v">'+ct.upper+'/63</span>';
+      }else{
+        const reste=Math.max(0,63-ct.upper);
+        td.innerHTML='<span class="v">'+ct.upper+'/63</span><span class="bonus-mini" style="display:block">reste '+reste+'</span>';
+      }
+      row.appendChild(td);
+    });
   });
   tb.appendChild(row);
 }
 
 /* ---------- saisie d'une case ---------- */
-let cur={player:null,cat:null,buf:""};
-function openCell(player,cat){
+let cur={player:null,col:0,cat:null,buf:""};
+function openCell(player,col,cat){
   if(player!==S.current){
     const p=S.players[player];
     openModal('<h3>Pas le joueur en cours</h3><div class="sub">'+"C'est à "+escapeHtml(S.players[S.current].name)+" de jouer."+'</div><div class="fixedbtns"><button class="btn primary" data-w="ok">Éditer '+escapeHtml(p.name)+' quand même</button><button class="btn" data-w="cancel">Annuler</button></div>');
-    document.querySelectorAll("#modalRoot [data-w]").forEach(b=>{b.onclick=()=>{const a=b.dataset.w;closeModal();if(a==="ok")openCellEditor(player,cat);};});
+    document.querySelectorAll("#modalRoot [data-w]").forEach(b=>{b.onclick=()=>{const a=b.dataset.w;closeModal();if(a==="ok")openCellEditor(player,col,cat);};});
   }else{
-    openCellEditor(player,cat);
+    openCellEditor(player,col,cat);
   }
 }
 
-function openCellEditor(player,cat){
-  cur={player,cat,buf:""};
-  const p=S.players[player], val=p.scores[cat], catMeta=CATS.find(c=>c.k===cat);
+function openCellEditor(player,col,cat){
+  cur={player,col,cat,buf:""};
+  const p=S.players[player], val=p.scores[col][cat], catMeta=gameCats().find(c=>c.k===cat);
   const filled=(val!==null&&val!==undefined);
-  const head='<h3>'+catMeta.label+'</h3><div class="sub">'+escapeHtml(p.name)+(filled?(" · actuel : "+val):"")+'</div>';
+  const multi=S.columns.length>1;
+  const sub=escapeHtml(p.name)+(multi?" · colonne "+COL_LABELS[S.columns[col]]:"")+(filled?(" · actuel : "+val):"");
+  const head='<h3>'+catMeta.label+'</h3><div class="sub">'+sub+'</div>';
 
   // section du haut : les multiples du chiffre (0 à 5 dés)
   if(UPPER.includes(cat)){
@@ -971,8 +1101,8 @@ function openCellEditor(player,cat){
     if(filled)html+='<button class="btn danger" data-act="clear">Effacer</button>';
     html+='<button class="btn" data-act="cancel">Annuler</button></div>';
     openModal(html);
-    document.querySelectorAll("#modalRoot .mbtn").forEach(b=>{b.onclick=()=>{emit("set_score",{player,category:cat,value:parseInt(b.dataset.v,10)});closeModal();};});
-    document.querySelectorAll("#modalRoot [data-act]").forEach(b=>{b.onclick=()=>{const a=b.dataset.act;if(a==="cancel")closeModal();else if(a==="clear"){emit("set_score",{player,category:cat,value:null});closeModal();}};});
+    document.querySelectorAll("#modalRoot .mbtn").forEach(b=>{b.onclick=()=>{emit("set_score",{player,col,category:cat,value:parseInt(b.dataset.v,10)});closeModal();};});
+    document.querySelectorAll("#modalRoot [data-act]").forEach(b=>{b.onclick=()=>{const a=b.dataset.act;if(a==="cancel")closeModal();else if(a==="clear"){emit("set_score",{player,col,category:cat,value:null});closeModal();}};});
     return;
   }
 
@@ -989,7 +1119,7 @@ function openCellEditor(player,cat){
     return;
   }
 
-  // brelan, carré, chance, mini, maxi : pavé numérique
+  // brelan, carré, chance, maxi, mini : pavé numérique
   cur.buf=filled?String(val):"";
   let html=head+'<div class="display'+(cur.buf?"":" empty")+'" id="disp">'+(cur.buf||"0")+'</div>';
   if(S.dice_enabled&&S.turn_rolled){const sug=scoreFor(cat,S.dice);html+='<div class="suggest"><button data-act="sug" data-v="'+sug+'">Score des dés : '+sug+'</button></div>';}
@@ -1019,8 +1149,8 @@ function bindNumber(){
     const a=b.dataset.act;
     b.onclick=()=>{
       if(a==="cancel")closeModal();
-      else if(a==="clear"){emit("set_score",{player:cur.player,category:cur.cat,value:null});closeModal();}
-      else if(a==="ok"){emit("set_score",{player:cur.player,category:cur.cat,value:cur.buf===""?0:parseInt(cur.buf,10)});closeModal();}
+      else if(a==="clear"){emit("set_score",{player:cur.player,col:cur.col,category:cur.cat,value:null});closeModal();}
+      else if(a==="ok"){emit("set_score",{player:cur.player,col:cur.col,category:cur.cat,value:cur.buf===""?0:parseInt(cur.buf,10)});closeModal();}
       else if(a==="sug"){cur.buf=b.dataset.v;const d=$("disp");d.textContent=cur.buf;d.classList.remove("empty");}
     };
   });
@@ -1030,9 +1160,9 @@ function bindFixed(cat){
     const a=b.dataset.act;
     b.onclick=()=>{
       if(a==="cancel")closeModal();
-      else if(a==="fixed"){emit("set_score",{player:cur.player,category:cur.cat,value:FIXED[cat]});closeModal();}
-      else if(a==="zero"){emit("set_score",{player:cur.player,category:cur.cat,value:0});closeModal();}
-      else if(a==="clear"){emit("set_score",{player:cur.player,category:cur.cat,value:null});closeModal();}
+      else if(a==="fixed"){emit("set_score",{player:cur.player,col:cur.col,category:cur.cat,value:FIXED[cat]});closeModal();}
+      else if(a==="zero"){emit("set_score",{player:cur.player,col:cur.col,category:cur.cat,value:0});closeModal();}
+      else if(a==="clear"){emit("set_score",{player:cur.player,col:cur.col,category:cur.cat,value:null});closeModal();}
     };
   });
 }
