@@ -524,6 +524,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .rowlabel{position:sticky;left:0;background:var(--panel);text-align:left !important;z-index:2;width:104px;min-width:88px;
     padding:9px 8px !important;font-weight:500;font-size:13px}
   table.sheet td.rowlabel,table.sheet th.rowlabel{white-space:normal;line-height:1.25;overflow-wrap:break-word}
+  .rowlabel .hint,.rowlabel .bonus-mini{white-space:nowrap}
   thead .rowlabel{background:var(--panel-2);z-index:4}
   .rowlabel .hint{display:block;font-size:10.5px;color:var(--muted-2);font-weight:400;margin-top:1px}
   .phead{padding:9px 6px !important;min-width:66px}
