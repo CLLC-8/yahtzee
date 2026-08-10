@@ -521,8 +521,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   table.sheet{border-collapse:collapse;width:100%;font-size:14px}
   table.sheet th,table.sheet td{padding:0;text-align:center;border-bottom:1px solid var(--line);white-space:nowrap}
   table.sheet thead th{position:sticky;top:0;background:var(--panel-2);z-index:3}
-  .rowlabel{position:sticky;left:0;background:var(--panel);text-align:left !important;z-index:2;min-width:120px;
-    padding:10px 9px !important;font-weight:500;font-size:13.5px}
+  .rowlabel{position:sticky;left:0;background:var(--panel);text-align:left !important;z-index:2;width:104px;min-width:88px;
+    padding:9px 8px !important;font-weight:500;font-size:13px}
+  table.sheet td.rowlabel,table.sheet th.rowlabel{white-space:normal;line-height:1.25;overflow-wrap:break-word}
   thead .rowlabel{background:var(--panel-2);z-index:4}
   .rowlabel .hint{display:block;font-size:10.5px;color:var(--muted-2);font-weight:400;margin-top:1px}
   .phead{padding:9px 6px !important;min-width:66px}
@@ -555,6 +556,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   table.sheet.multicol .cell{min-width:48px;font-size:14px;height:42px}
   table.sheet.multicol tr.total .cell{font-size:17px}
   table.sheet.multicol .phead{min-width:0}
+  table.sheet.multicol .rowlabel{width:86px;min-width:76px;font-size:12.5px}
 
   .donebar{margin-top:12px;text-align:center;background:linear-gradient(180deg,rgba(240,181,61,.16),rgba(240,181,61,.04));
     border:1px solid var(--gold);border-radius:12px;padding:13px;font-weight:600}
