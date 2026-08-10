@@ -1200,10 +1200,11 @@ function openRename(i){
 /* ---------- menu ---------- */
 $("btnMenu").onclick=()=>{
   let html='<h3>Menu</h3><div class="fixedbtns">';
+  html+='<button class="btn" data-m="nextp">Passer au joueur suivant</button>';
   html+='<button class="btn" data-m="add">Ajouter un joueur</button>';
+  html+='<button class="btn" data-m="delp">Supprimer un joueur</button>';
   html+='<button class="btn" data-m="share">Copier le lien de la partie</button>';
   html+='<button class="btn" data-m="home">Accueil / autre partie</button>';
-  html+='<button class="btn danger" data-m="new">Nouvelle partie</button>';
   html+='<button class="btn" data-m="close">Fermer</button>';
   html+='</div>';
   openModal(html);
@@ -1211,12 +1212,33 @@ $("btnMenu").onclick=()=>{
     b.onclick=()=>{
       const m=b.dataset.m;closeModal();
       if(m==="add")emit("add_player",{});
+      else if(m==="delp")openDeletePlayer();
+      else if(m==="nextp"){
+        const nxt=(S.current+1)%S.players.length;
+        emit("set_current",{player:nxt});
+        toast("À "+S.players[nxt].name+" de jouer");
+      }
       else if(m==="share")shareLink();
       else if(m==="home"){history.replaceState(null,"",location.pathname);gid=null;S=null;openSetup();}
-      else if(m==="new"){if(confirm("Démarrer une nouvelle partie ? La feuille actuelle sera quittée.")){localStorage.removeItem(LS);location.href=location.pathname;}}
     };
   });
 };
+
+function openDeletePlayer(){
+  if(S.players.length<=1){toast("Il faut au moins un joueur");return;}
+  let html='<h3>Supprimer un joueur</h3><div class="sub">Choisis le joueur à retirer (ses scores seront perdus)</div><div class="fixedbtns">';
+  S.players.forEach((p,i)=>{html+='<button class="btn" data-del="'+i+'">'+escapeHtml(p.name)+'</button>';});
+  html+='<button class="btn danger" data-del="cancel" style="border-color:var(--line);color:var(--muted)">Annuler</button></div>';
+  openModal(html);
+  document.querySelectorAll("#modalRoot [data-del]").forEach(b=>{
+    b.onclick=()=>{
+      const v=b.dataset.del;
+      if(v==="cancel"){closeModal();return;}
+      const i=parseInt(v,10);
+      if(confirm("Supprimer "+S.players[i].name+" ?")){emit("remove_player",{player:i});closeModal();}
+    };
+  });
+}
 $("btnShare").onclick=shareLink;
 function shareLink(){
   const url=location.origin+location.pathname+"?game="+gid;
