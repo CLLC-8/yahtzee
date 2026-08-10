@@ -1060,8 +1060,6 @@ function addBonusRow(tb,multi){
       const ct=p.totals.cols[j];
       if(ct.bonus>0){
         td.innerHTML='<span class="v" style="color:var(--mint)">+35 ✓</span>';
-      }else if(multi){
-        td.innerHTML='<span class="v">'+ct.upper+'/63</span>';
       }else{
         const reste=Math.max(0,63-ct.upper);
         td.innerHTML='<span class="v">'+ct.upper+'/63</span><span class="bonus-mini" style="display:block">reste '+reste+'</span>';
