@@ -11,8 +11,9 @@ Variantes (choisies à la création de la partie) :
     (bas -> haut). À chaque tour, on remplit UNE case dans la colonne de
     son choix. Dans une colonne ordonnée, seule la prochaine case imposée
     est acceptée. Le total du joueur = somme de ses colonnes.
-  - Mini & Maxi : deux cases "somme des dés" dans chaque colonne ;
-    l'écart (Maxi - Mini) s'ajoute au total de la colonne (0 si Maxi <= Mini).
+  - Mini & Maxi (règle Yamb) : deux cases "somme des dés" dans chaque
+    colonne ; la colonne gagne (Maxi - Mini) x nombre de 1 de sa case As
+    (0 si Maxi <= Mini ou si la case As vaut 0).
 
 Lancer :  python app.py   ->  http://localhost:5000
 Prod   :  gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 --bind 0.0.0.0:$PORT app:app
@@ -102,7 +103,9 @@ def totals(g, player):
         if g.get("minimax"):
             ma, mi = sc.get("maxi"), sc.get("mini")
             if ma is not None and mi is not None and ma > mi:
-                ecart = ma - mi
+                # règle Yamb : (Maxi - Mini) x nombre de 1 de la case As
+                # (la valeur de la case As = somme des 1 = leur nombre)
+                ecart = (ma - mi) * (sc.get("un") or 0)
         tot = upper + bonus + lower + ecart
         grand += tot
         complete = complete and all(sc[c] is not None for c in cats)
@@ -661,7 +664,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="seg-hint" id="colHint"></div>
       <div class="toggle-row" style="margin:14px 0 0">
-        <div class="t">Mini &amp; Maxi<small>Deux cases « somme des dés » — l'écart (Maxi − Mini) s'ajoute au total</small></div>
+        <div class="t">Mini &amp; Maxi<small>Règle Yamb : (Maxi − Mini) × nb de 1 de la case As s'ajoute au total</small></div>
         <div class="sw" id="mmSw"></div>
       </div>
       <button class="btn primary" id="btnStart" style="margin-top:16px">Commencer</button>
@@ -1024,9 +1027,12 @@ function renderSheet(){
   if(S.minimax){
     addCatRow(CATS_MM[0],"sep");
     addCatRow(CATS_MM[1]);
-    addTotalRow("Écart Maxi − Mini",(p,j)=>{
-      const ma=p.scores[j].maxi,mi=p.scores[j].mini;
-      return (ma!==null&&ma!==undefined&&mi!==null&&mi!==undefined)?p.totals.cols[j].ecart:"—";
+    addTotalRow('Écart × As <span class="bonus-mini">(Maxi − Mini) × nb de 1</span>',(p,j)=>{
+      const s=p.scores[j], ma=s.maxi, mi=s.mini;
+      if(ma===null||ma===undefined||mi===null||mi===undefined)return "—";
+      const d=Math.max(0,ma-mi);
+      if(s.un===null||s.un===undefined)return d>0?d+"×?":0;  // en attente de la case As
+      return p.totals.cols[j].ecart;
     },"sub");
   }
   CATS_LOWER.forEach((c,i)=>addCatRow(c,i===0?"sep":""));
